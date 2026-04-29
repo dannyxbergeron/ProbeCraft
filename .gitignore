@@ -1,0 +1,5 @@
+.snakemake
+data
+results
+*old*
+logs

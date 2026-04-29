@@ -1,0 +1,121 @@
+ClinVar API vs Web Download Comparison for POLR3A
+==================================================
+Date: 2026-04-23
+Files compared:
+  - data/POLR3A/clinvar_mutations.tsv (API, fetched via NCBI E-utilities)
+  - data/POLR3A/clinvar_mutations_web.tsv (Web, downloaded from ClinVar website)
+
+OVERVIEW
+--------
+API mutations:   413
+Web mutations:   461
+Shared:          413  (all API mutations are present in the web file)
+Only in Web:      48
+Only in API:       0
+
+SHARED MUTATIONS (413)
+----------------------
+All 413 shared mutations match exactly on protein change and clinical
+significance. No discrepancies found.
+
+WEB-ONLY MUTATIONS (48)
+-----------------------
+
+Accession          VariationID  Protein change  Germline classification
+VCV000301046         301046     D1094N          Conflicting classifications of pathogenicity
+VCV000301081         301081     A161T           Uncertain significance
+VCV000549558         549558     R1069Q          Conflicting classifications of pathogenicity
+VCV001009026        1009026     D1096H          Uncertain significance
+VCV001030184        1030184     A1095T          Uncertain significance
+VCV001063706        1063706     I1084V          Uncertain significance
+VCV001184049        1184049     P91L            not provided
+VCV001184053        1184053     R1069W          Likely pathogenic
+VCV001304562        1304562     R67H            Uncertain significance
+VCV001310117        1310117     R1069L          Uncertain significance
+VCV001352466        1352466     I104V           Uncertain significance
+VCV001381131        1381131     T62M            Uncertain significance
+VCV001382598        1382598     D78N            Uncertain significance
+VCV001399984        1399984     C159Y           Uncertain significance
+VCV001405154        1405154     A77S            Uncertain significance
+VCV001408117        1408117     D78E            Uncertain significance
+VCV001413017        1413017     H114Y           Uncertain significance
+VCV001419408        1419408     R99G            Uncertain significance
+VCV001428573        1428573     D1090G          Uncertain significance
+VCV001437386        1437386     R151Q           Uncertain significance
+VCV001446880        1446880     G133S           Conflicting classifications of pathogenicity
+VCV001449594        1449594     D87N            Uncertain significance
+VCV001467994        1467994     P91S            Uncertain significance
+VCV001501676        1501676     P1083A          Uncertain significance
+VCV001517733        1517733     H114Q           Uncertain significance
+VCV001522759        1522759     I1074T          Uncertain significance
+VCV001625743        1625743     C92S            Likely benign
+VCV001897633        1897633     G133V           Uncertain significance
+VCV002116450        2116450     L129Q           Uncertain significance
+VCV002130358        2130358     Y128C           Uncertain significance
+VCV002136898        2136898     M116V           Uncertain significance
+VCV002151264        2151264     R140Q           Uncertain significance
+VCV002187253        2187253     R151W           Uncertain significance
+VCV002308871        2308871     K123Q           Uncertain significance
+VCV002309014        2309014     Y136F           Uncertain significance
+VCV002427809        2427809     A1095V          Uncertain significance
+VCV002500201        2500201     G84E            Likely pathogenic
+VCV002640625        2640625     G141R           Uncertain significance
+VCV002640626        2640626     R99I            Uncertain significance
+VCV003052098        3052098     C92Y            Uncertain significance
+VCV003390165        3390165     Q138R           Uncertain significance
+VCV003608913        3608913     G96E            Uncertain significance
+VCV003694315        3694315     D1092G          Uncertain significance
+VCV003715023        3715023     G84V            Uncertain significance
+VCV004541556        4541556     D127N           Uncertain significance
+VCV004628177        4628177     M107I           Uncertain significance
+VCV004628179        4628179     A1079T          Uncertain significance
+VCV004807532        4807532     A1098T          Uncertain significance
+
+Classification breakdown of web-only mutations:
+  Uncertain significance:                          41
+  Conflicting classifications of pathogenicity:     3
+  Likely pathogenic:                                2
+  not provided:                                     1
+  Likely benign:                                    1
+
+Classification breakdown of shared mutations (for comparison):
+  Uncertain significance:                         343
+  Conflicting classifications of pathogenicity:    28
+  not provided:                                    14
+  Likely pathogenic:                               13
+  Benign/Likely benign:                             4
+  Pathogenic/Likely pathogenic:                     4
+  Pathogenic:                                       3
+  Likely benign:                                    2
+  None:                                             2
+
+VariationID ranges:
+  Shared mutations:    31,143  -  4,813,808  (median: 1,476,814)
+  Web-only mutations: 301,046  -  4,807,532  (median: 1,517,733)
+
+LIKELY CAUSES OF DISCREPANCY
+-----------------------------
+
+1. Esearch query filtering
+   The API script uses this esearch term:
+     "POLR3A"[Gene] AND single_gene[prop] AND "missense variant"[molecular_consequence]
+   The ClinVar web interface uses a different/broader query when exporting TSV.
+   Some variants may be indexed differently, or the single_gene[prop] filter
+   excludes multi-gene records that the web view includes.
+
+2. Recent submissions not fully indexed
+   The web-only mutations cluster toward higher VariationIDs (newer submissions).
+   NCBI's E-utilities esearch index can lag behind the web-facing database,
+   so recently submitted variants may not yet appear in API results.
+
+3. cDNA position filter in the pipeline script
+   The script (scripts/fetch_clinvar.py, line 152) drops any record where the
+   cDNA change cannot be parsed into a numeric mRNA position:
+     if p and p["mrna_position"] is not None:
+   Variants without a standard c.NNNX>Y notation in their esummary record
+   are silently excluded.
+
+4. Esummary data completeness
+   Newer/less-curated entries may have incomplete annotation in the esummary
+   response (missing transcript ID, cDNA change, or protein change), causing
+   them to be skipped by parse_record() even if esearch returns their UID.

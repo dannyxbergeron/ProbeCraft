@@ -1,0 +1,12 @@
+genes:
+  - POLR3A
+  # - BRCA1
+
+ncbi_api_key: ""  # Optional: set for 10 req/s instead of 3
+
+probe_params:
+  target_length: 25
+  min_length: 24
+  max_length: 26
+  junction_buffer: 5
+  scan_offset: 5
