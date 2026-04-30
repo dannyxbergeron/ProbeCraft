@@ -20,11 +20,58 @@ log = logging.getLogger(__name__)
 
 EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 BATCH_SIZE = 200
+MAX_RETRIES = 5
 
 
-def esearch_clinvar(gene: str, api_key: str) -> list[str]:
-    """Search ClinVar for missense variants of a gene. Return list of UIDs."""
-    term = f'"{gene}"[Gene] AND "missense variant"[molecular_consequence]'
+def build_consequence_filter(consequences: str | list[str]) -> str:
+    """Build the molecular_consequence portion of a ClinVar esearch term.
+
+    Args:
+        consequences: "all" to skip filtering, or a list of consequence strings.
+
+    Returns:
+        Empty string if "all", else an AND clause like:
+        AND ("type1"[molecular_consequence] OR "type2"[molecular_consequence])
+    """
+    if consequences == "all":
+        return ""
+
+    if isinstance(consequences, str):
+        consequences = [consequences]
+
+    if len(consequences) == 1:
+        return f' AND "{consequences[0]}"[molecular_consequence]'
+
+    parts = " OR ".join(
+        f'"{c}"[molecular_consequence]' for c in consequences
+    )
+    return f" AND ({parts})"
+
+
+def _get_delay(api_key: str) -> float:
+    """Return inter-request delay. Without API key, use a longer delay
+    to stay within NCBI's 3 req/s limit even with parallel jobs."""
+    return 0.11 if api_key else 0.5
+
+
+def _rate_limited_get(url: str, params: dict, api_key: str) -> requests.Response:
+    """GET with retry on 429 (rate limit) using exponential backoff."""
+    delay = _get_delay(api_key)
+    for attempt in range(MAX_RETRIES):
+        time.sleep(delay)
+        resp = requests.get(url, params=params)
+        if resp.status_code != 429:
+            return resp
+        wait = (2 ** attempt) * delay
+        log.warning(f"429 rate limited, retry {attempt + 1}/{MAX_RETRIES} in {wait:.1f}s")
+        time.sleep(wait)
+    resp.raise_for_status()
+    return resp
+
+
+def esearch_clinvar(gene: str, api_key: str, consequences: str | list[str]) -> list[str]:
+    """Search ClinVar for variants of a gene. Return list of UIDs."""
+    term = f'"{gene}"[Gene]{build_consequence_filter(consequences)}'
     params = {
         "db": "clinvar",
         "term": term,
@@ -36,7 +83,7 @@ def esearch_clinvar(gene: str, api_key: str) -> list[str]:
 
     url = f"{EUTILS_BASE}/esearch.fcgi"
     log.info(f"esearch: {url} term={term}")
-    resp = requests.get(url, params=params)
+    resp = _rate_limited_get(url, params, api_key)
     resp.raise_for_status()
     data = resp.json()
 
@@ -49,15 +96,11 @@ def esearch_clinvar(gene: str, api_key: str) -> list[str]:
     for retstart in range(0, count, retmax):
         params["retmax"] = retmax
         params["retstart"] = retstart
-        resp = requests.get(url, params=params)
+        resp = _rate_limited_get(url, params, api_key)
         resp.raise_for_status()
         data = resp.json()
         batch_ids = data["esearchresult"]["idlist"]
         all_ids.extend(batch_ids)
-        if api_key:
-            time.sleep(0.11)
-        else:
-            time.sleep(0.35)
 
     log.info(f"Retrieved {len(all_ids)} IDs total")
     return all_ids
@@ -78,7 +121,7 @@ def esummary_batch(ids: list[str], api_key: str) -> list[dict]:
 
         url = f"{EUTILS_BASE}/esummary.fcgi"
         log.info(f"esummary batch {i // BATCH_SIZE + 1}: {len(batch)} IDs")
-        resp = requests.get(url, params=params)
+        resp = _rate_limited_get(url, params, api_key)
         resp.raise_for_status()
         data = resp.json()
 
@@ -86,7 +129,6 @@ def esummary_batch(ids: list[str], api_key: str) -> list[dict]:
             if uid in data.get("result", {}):
                 all_records.append(data["result"][uid])
 
-        time.sleep(0.35 if not api_key else 0.11)
     return all_records
 
 
@@ -152,12 +194,14 @@ def parse_record(record: dict) -> dict | None:
 def main():
     gene = snakemake.params.gene
     api_key = snakemake.params.api_key
+    consequences = snakemake.params.molecular_consequences
     output_mutations = snakemake.output.mutations
     output_transcript = snakemake.output.transcript_id
 
-    log.info(f"Fetching ClinVar missense mutations for gene: {gene}")
+    consequence_desc = "all types" if consequences == "all" else ", ".join(consequences)
+    log.info(f"Fetching ClinVar variants for gene: {gene} (consequences: {consequence_desc})")
 
-    ids = esearch_clinvar(gene, api_key)
+    ids = esearch_clinvar(gene, api_key, consequences)
     if not ids:
         log.error(f"No ClinVar records found for {gene}")
         sys.exit(1)

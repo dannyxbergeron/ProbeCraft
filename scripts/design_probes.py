@@ -225,6 +225,9 @@ def main():
             f"excluded from probe design"
         )
 
+    mutations_with_pos["protein_change"] = mutations_with_pos["protein_change"].fillna("")
+    mutations_with_pos["cdna_change"] = mutations_with_pos["cdna_change"].fillna("")
+
     mutation_positions = mutations_with_pos["mrna_position"].tolist()
     mutation_labels = mutations_with_pos["protein_change"].tolist()
     mutation_cdna_changes = mutations_with_pos["cdna_change"].tolist()

@@ -5,6 +5,7 @@ rule fetch_clinvar:
     params:
         gene="{gene}",
         api_key=config.get("ncbi_api_key", ""),
+        molecular_consequences=config.get("molecular_consequences", ["missense variant"]),
     log: "logs/fetch_clinvar/{gene}.log"
     conda: "../envs/fetch.yaml"
     script: "../scripts/fetch_clinvar.py"

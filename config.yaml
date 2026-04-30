@@ -1,8 +1,26 @@
 genes:
   - POLR3A
-  # - BRCA1
+  # - EIF4A2
 
 ncbi_api_key: ""  # Optional: set for 10 req/s instead of 3
+
+# ClinVar molecular consequence filter — one value, a list, or "all"
+# Default: ["missense variant"] if key omitted
+#
+# Valid values:
+#   missense variant, intron variant, synonymous variant,
+#   non-coding transcript variant, frameshift variant,
+#   5 prime UTR variant, 3 prime UTR variant, nonsense,
+#   splice donor variant, splice acceptor variant,
+#   inframe deletion, inframe insertion,
+#   initiator codon variant, inframe indel,
+#   stop lost, genic upstream transcript variant,
+#   genic downstream transcript variant, no sequence alteration
+#
+# Use "all" to fetch every consequence type (no filter applied).
+molecular_consequences:
+  - missense variant
+  # - nonsense
 
 probe_params:
   target_length: 25
