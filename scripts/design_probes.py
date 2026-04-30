@@ -60,6 +60,7 @@ def build_forbidden_zones(junctions: list[int], buffer: int) -> list[tuple[int, 
 def design_probes(
     mutation_positions: list[int],
     mutation_labels: list[str],
+    mutation_cdna_changes: list[str],
     sequence: str,
     junction_positions: list[int],
     target_len: int,
@@ -68,6 +69,7 @@ def design_probes(
     junction_buffer: int,
     scan_offset: int,
     gene: str,
+    cds_mrna_start: int,
 ) -> list[dict]:
     forbidden = build_forbidden_zones(junction_positions, junction_buffer)
     log.info(f"Forbidden zones: {forbidden}")
@@ -112,7 +114,7 @@ def design_probes(
                 ]
 
                 overlaps_existing = any(
-                    intervals_overlap(probe_start, probe_end, p["start"], p["end"])
+                    intervals_overlap(probe_start, probe_end, p["mrna_start"], p["mrna_end"])
                     for p in probes
                 )
 
@@ -142,7 +144,7 @@ def design_probes(
         if best_probe is None:
             log.warning(
                 f"Cannot place probe for mutation {mutation_labels[first_idx]} "
-                f"at position {target_pos} — skipping"
+                f"at mRNA position {target_pos} — skipping"
             )
             uncovered.discard(first_idx)
             continue
@@ -159,17 +161,26 @@ def design_probes(
 
         covered_mutations = [mutation_labels[i] for i in covered_idxs]
         covered_positions = [mutation_positions[i] for i in covered_idxs]
+        covered_cdna = [mutation_cdna_changes[i] for i in covered_idxs]
+
+        mrna_start = best_probe["start"]
+        mrna_end = best_probe["end"]
+        cds_start = mrna_start - cds_mrna_start + 1
+        cds_end = mrna_end - cds_mrna_start + 1
 
         probes.append({
             "probe_name": f"{gene}-{probe_counter}",
-            "start": best_probe["start"],
-            "end": best_probe["end"],
+            "mrna_start": mrna_start,
+            "mrna_end": mrna_end,
+            "cds_start": cds_start,
+            "cds_end": cds_end,
             "length": best_probe["length"],
             "target_sequence": target_seq,
             "fwd_oligo": fwd_oligo,
             "rev_oligo": rev_oligo,
-            "mutations_covered": ";".join(covered_mutations),
-            "mutation_positions": ";".join(str(p) for p in covered_positions),
+            "mutations_covered": ",".join(covered_mutations),
+            "cdna_changes_covered": ",".join(covered_cdna),
+            "mutation_positions": ",".join(str(p) for p in covered_positions),
         })
 
         uncovered -= set(covered_idxs)
@@ -192,8 +203,31 @@ def main():
     sequence = transcript_df.loc[transcript_df["field"] == "sequence", "value"].values[0]
     junction_positions = junctions_df["mrna_position"].tolist()
 
-    mutation_positions = mutations_df["mrna_position"].tolist()
-    mutation_labels = mutations_df["protein_change"].tolist()
+    # Read CDS start from transcript.tsv
+    cds_start_row = transcript_df.loc[transcript_df["field"] == "cds_start", "value"]
+    if cds_start_row.empty:
+        log.error("No cds_start found in transcript.tsv — re-run fetch_transcript")
+        sys.exit(1)
+    cds_mrna_start = int(cds_start_row.values[0])
+    log.info(f"CDS starts at mRNA position {cds_mrna_start}")
+
+    # Convert cdna_position to mrna_position
+    # cdna_position is the c.N value (CDS-relative), mrna_position is absolute on the transcript
+    mutations_with_pos = mutations_df[mutations_df["cdna_position"].notna()].copy()
+    mutations_with_pos["cdna_position"] = mutations_with_pos["cdna_position"].astype(int)
+    mutations_with_pos["mrna_position"] = mutations_with_pos["cdna_position"] + cds_mrna_start - 1
+
+    n_total = len(mutations_df)
+    n_without_cdna = n_total - len(mutations_with_pos)
+    if n_without_cdna > 0:
+        log.info(
+            f"{n_without_cdna}/{n_total} mutations have no valid cDNA position — "
+            f"excluded from probe design"
+        )
+
+    mutation_positions = mutations_with_pos["mrna_position"].tolist()
+    mutation_labels = mutations_with_pos["protein_change"].tolist()
+    mutation_cdna_changes = mutations_with_pos["cdna_change"].tolist()
 
     log.info(
         f"Designing probes for {gene}: {len(mutation_positions)} mutations, "
@@ -203,6 +237,7 @@ def main():
     probes = design_probes(
         mutation_positions=mutation_positions,
         mutation_labels=mutation_labels,
+        mutation_cdna_changes=mutation_cdna_changes,
         sequence=sequence,
         junction_positions=junction_positions,
         target_len=target_len,
@@ -211,13 +246,14 @@ def main():
         junction_buffer=junction_buffer,
         scan_offset=scan_offset,
         gene=gene,
+        cds_mrna_start=cds_mrna_start,
     )
 
     log.info(f"Designed {len(probes)} probes")
 
     covered = set()
     for p in probes:
-        for pos_str in p["mutation_positions"].split(";"):
+        for pos_str in p["mutation_positions"].split(","):
             covered.add(int(pos_str))
     total = set(mutation_positions)
     log.info(

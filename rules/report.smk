@@ -5,7 +5,8 @@ rule generate_report:
         junctions="data/{gene}/junctions.tsv",
         probes="data/{gene}/probes.tsv",
     output:
-        "results/{gene}/{gene}_report.html",
+        report="results/{gene}/{gene}_report.html",
+        mutations_file="results/{gene}/{gene}_mutations.tsv",
     params:
         gene="{gene}",
     log: "logs/generate_report/{gene}.log"

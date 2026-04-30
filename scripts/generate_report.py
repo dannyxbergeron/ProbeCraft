@@ -2,6 +2,7 @@
 
 import json
 import logging
+from datetime import date
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -14,6 +15,26 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+SIG_COLORS = {
+    "Pathogenic": "#e74c3c",
+    "Pathogenic/Likely pathogenic": "#e74c3c",
+    "Likely pathogenic": "#e67e22",
+    "Uncertain significance": "#f39c12",
+    "Likely benign": "#27ae60",
+    "Benign": "#2ecc71",
+    "Benign/Likely benign": "#2ecc71",
+}
+
+SIG_CLASS = {
+    "Pathogenic": "p",
+    "Pathogenic/Likely pathogenic": "p",
+    "Likely pathogenic": "lp",
+    "Uncertain significance": "v",
+    "Likely benign": "lb",
+    "Benign": "b",
+    "Benign/Likely benign": "b",
+}
+
 
 def load_data(mutations_path, transcript_path, junctions_path, probes_path):
     mutations_df = pd.read_csv(mutations_path, sep="\t")
@@ -21,22 +42,71 @@ def load_data(mutations_path, transcript_path, junctions_path, probes_path):
     junctions_df = pd.read_csv(junctions_path, sep="\t")
     probes_df = pd.read_csv(probes_path, sep="\t")
 
-    sequence = transcript_df.loc[
-        transcript_df["field"] == "sequence", "value"
-    ].values[0]
-    accession = transcript_df.loc[
-        transcript_df["field"] == "accession", "value"
-    ].values[0]
+    def get_field(name):
+        row = transcript_df.loc[transcript_df["field"] == name, "value"]
+        return row.values[0] if not row.empty else None
 
-    return mutations_df, sequence, accession, junctions_df, probes_df
+    sequence = get_field("sequence")
+    accession = get_field("accession")
+    cds_start = int(get_field("cds_start")) if get_field("cds_start") else None
+    cds_end = int(get_field("cds_end")) if get_field("cds_end") else None
+
+    return mutations_df, sequence, accession, cds_start, cds_end, junctions_df, probes_df
 
 
-def build_plotly_figure(
-    mutations_df, accession, junctions_df, probes_df, seq_len
-):
+def compute_exon_number(mrna_pos, junctions_df):
+    """Determine which exon a mRNA position falls in."""
+    if pd.isna(mrna_pos):
+        return ""
+    pos = int(mrna_pos)
+    junction_positions = junctions_df["mrna_position"].tolist()
+    for i, jpos in enumerate(junction_positions):
+        if pos <= jpos:
+            return i + 1
+    return len(junction_positions) + 1
+
+
+def build_enriched_mutations(mutations_df, cds_start, junctions_df, probes_df):
+    """Add computed columns to mutations: mrna_position, exon, probe_name, id."""
+    df = mutations_df.copy()
+
+    # Compute mRNA position from cdna_position
+    if cds_start and "cdna_position" in df.columns:
+        has_pos = df["cdna_position"].notna()
+        df.loc[has_pos, "mrna_position"] = (
+            df.loc[has_pos, "cdna_position"].astype(int) + cds_start - 1
+        ).astype(int)
+        df.loc[~has_pos, "mrna_position"] = None
+    elif "mrna_position" not in df.columns:
+        df["mrna_position"] = None
+
+    # HGVS ID: NM_007055.4(POLR3A):c.251G>A
+    df["id"] = df["transcript_id"] + "(" + df["gene"] + "):" + df["cdna_change"]
+
+    # Exon number
+    df["exon"] = df["mrna_position"].apply(
+        lambda p: compute_exon_number(p, junctions_df)
+    )
+
+    # Probe name: which probe covers this mutation
+    probe_lookup = {}
+    for _, prow in probes_df.iterrows():
+        for pos_str in str(prow["mutation_positions"]).split(","):
+            if pos_str.strip():
+                pos = int(pos_str.strip())
+                probe_lookup.setdefault(pos, []).append(prow["probe_name"])
+
+    df["probe"] = df["mrna_position"].apply(
+        lambda p: ", ".join(sorted(set(probe_lookup.get(int(p), [])))) if pd.notna(p) and int(p) in probe_lookup else ""
+    )
+
+    return df
+
+
+def build_plotly_figure(mutations_df, accession, junctions_df, probes_df, seq_len):
     fig = go.Figure()
 
-    # --- Exon blocks ---
+    # Exon blocks
     exons = []
     prev_end = 0
     for _, jrow in junctions_df.iterrows():
@@ -44,77 +114,54 @@ def build_plotly_figure(
         prev_end = jrow["mrna_position"]
     exons.append((prev_end + 1, seq_len))
 
-    colors = []
     n_exons = len(exons)
-    for i in range(n_exons):
-        colors.append(f"hsl({int(210 + 40 * (i / n_exons))}, 60%, 75%)")
-
     for i, (start, end) in enumerate(exons):
+        color = f"hsl({int(210 + 40 * (i / n_exons))}, 60%, 75%)"
         fig.add_trace(
             go.Bar(
-                x=[end - start + 1],
-                y=[1],
-                base=start - 1,
-                orientation="h",
-                marker_color=colors[i],
-                name=f"Exon {i + 1}",
+                x=[end - start + 1], y=[1], base=start - 1,
+                orientation="h", marker_color=color,
                 hovertemplate=f"Exon {i + 1}<br>Position: {start}-{end}<extra></extra>",
                 showlegend=False,
             )
         )
 
-    # --- Mutations ---
-    sig_colors = {
-        "Pathogenic": "#e74c3c",
-        "Pathogenic/Likely pathogenic": "#e74c3c",
-        "Likely pathogenic": "#e67e22",
-        "Uncertain significance": "#f39c12",
-        "Likely benign": "#27ae60",
-        "Benign": "#2ecc71",
-        "Benign/Likely benign": "#2ecc71",
-    }
-
-    mut_colors = [
-        sig_colors.get(s, "#95a5a6") for s in mutations_df["clinical_significance"]
-    ]
-
+    # Mutations (only those with valid mrna_position)
+    mut_valid = mutations_df[mutations_df["mrna_position"].notna()]
+    mut_colors = [SIG_COLORS.get(s, "#95a5a6") for s in mut_valid["clinical_significance"]]
     hover_text = [
         f"<b>{row['protein_change']}</b><br>"
         f"cDNA: {row['cdna_change']}<br>"
         f"Significance: {row['clinical_significance']}<br>"
         f"Accession: {row['clinvar_accession']}<br>"
-        f"Position: {row['mrna_position']}"
-        for _, row in mutations_df.iterrows()
+        f"mRNA Position: {int(row['mrna_position'])}<br>"
+        f"CDS Position: {int(row['cdna_position']) if pd.notna(row.get('cdna_position')) else ''}"
+        for _, row in mut_valid.iterrows()
     ]
-
     fig.add_trace(
         go.Scatter(
-            x=mutations_df["mrna_position"].tolist(),
-            y=[1.8] * len(mutations_df),
+            x=mut_valid["mrna_position"].astype(int).tolist(),
+            y=[1.8] * len(mut_valid),
             mode="markers",
             marker=dict(size=6, color=mut_colors, line=dict(width=0.5, color="white")),
-            text=hover_text,
-            hoverinfo="text",
-            name="Mutations",
-            showlegend=False,
+            text=hover_text, hoverinfo="text", showlegend=False,
         )
     )
 
-    # --- Probes ---
+    # Probes
     for _, prow in probes_df.iterrows():
-        muts = prow["mutations_covered"].replace(";", ", ")
+        muts = prow["mutations_covered"]
         fig.add_trace(
             go.Bar(
-                x=[prow["end"] - prow["start"] + 1],
-                y=[2.6],
-                base=prow["start"] - 1,
+                x=[prow["mrna_end"] - prow["mrna_start"] + 1],
+                y=[2.6], base=prow["mrna_start"] - 1,
                 orientation="h",
                 marker_color="rgba(52, 152, 219, 0.5)",
                 marker_line=dict(color="rgba(41, 128, 185, 0.8)", width=1),
-                name=prow["probe_name"],
                 hovertemplate=(
                     f"<b>{prow['probe_name']}</b><br>"
-                    f"Position: {prow['start']}-{prow['end']} ({prow['length']} nt)<br>"
+                    f"mRNA: {prow['mrna_start']}-{prow['mrna_end']} ({prow['length']} nt)<br>"
+                    f"CDS: {prow['cds_start']}-{prow['cds_end']}<br>"
                     f"Mutations: {muts}<extra></extra>"
                 ),
                 showlegend=False,
@@ -124,17 +171,280 @@ def build_plotly_figure(
     fig.update_layout(
         barmode="overlay",
         xaxis=dict(title="mRNA Position (nt)", rangeslider=dict(visible=True)),
-        yaxis=dict(
-            tickvals=[1, 1.8, 2.6],
-            ticktext=["Exons", "Mutations", "Probes"],
-            range=[0.3, 3.2],
-        ),
-        height=400,
-        margin=dict(l=80, r=30, t=30, b=60),
-        plot_bgcolor="white",
+        yaxis=dict(tickvals=[1, 1.8, 2.6], ticktext=["Exons", "Mutations", "Probes"], range=[0.3, 3.2]),
+        height=400, margin=dict(l=80, r=30, t=30, b=60), plot_bgcolor="white",
     )
-
     return fig
+
+
+def build_annotated_sequence(sequence, cds_start, cds_end, junctions_df, mutations_df, probes_df):
+    """Generate HTML for the annotated mRNA sequence using CSS classes.
+    Returns (visual_html, copy_html) — two versions of the annotated sequence.
+    """
+    seq_len = len(sequence)
+    nts_per_line = 100
+    copy_nts_per_line = 60
+
+    # Build exon boundaries (1-based inclusive)
+    exon_bounds = []
+    prev_end = 0
+    for _, jrow in junctions_df.iterrows():
+        exon_bounds.append((prev_end + 1, int(jrow["mrna_position"])))
+        prev_end = int(jrow["mrna_position"])
+    exon_bounds.append((prev_end + 1, seq_len))
+
+    # Map mutation mRNA position -> list of (sig_class, color_hex, tooltip)
+    mut_map = {}
+    for _, mrow in mutations_df.iterrows():
+        if pd.notna(mrow.get("mrna_position")):
+            pos = int(mrow["mrna_position"])
+            sig = mrow["clinical_significance"]
+            sig_cls = SIG_CLASS.get(sig, "o")
+            color = SIG_COLORS.get(sig, "#e74c3c")
+            tip = f"{mrow['id']} | {sig} | mRNA pos: {pos}"
+            mut_map.setdefault(pos, []).append((sig_cls, color, tip))
+
+    # Probe colors: alternating
+    PROBE_COLORS = ["#dee6ef", "#ffffd7"]
+    probe_color_map = {}
+    for i, (_, prow) in enumerate(probes_df.iterrows()):
+        probe_color_map[prow["probe_name"]] = PROBE_COLORS[i % 2]
+
+    def blend_colors(colors):
+        if len(colors) == 1:
+            return colors[0]
+        r = sum(int(c[1:3], 16) for c in colors) // len(colors)
+        g = sum(int(c[3:5], 16) for c in colors) // len(colors)
+        b = sum(int(c[5:7], 16) for c in colors) // len(colors)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    # Map mRNA position -> background color from probe(s)
+    pos_probes = {}
+    for _, prow in probes_df.iterrows():
+        name = prow["probe_name"]
+        for p in range(int(prow["mrna_start"]), int(prow["mrna_end"]) + 1):
+            pos_probes.setdefault(p, []).append(name)
+
+    probe_bg = {}
+    for p, names in pos_probes.items():
+        unique_colors = list(set(probe_color_map[n] for n in names))
+        probe_bg[p] = blend_colors(unique_colors)
+
+    # Probe info for label placement
+    probe_info = []
+    for _, prow in probes_df.iterrows():
+        probe_info.append({
+            "name": prow["probe_name"],
+            "start": int(prow["mrna_start"]),
+            "end": int(prow["mrna_end"]),
+        })
+
+    def get_labels_for_line(line_start, line_end):
+        """Return [(midpoint_position, name), ...] for probes showing labels."""
+        labels = []
+        for pi in probe_info:
+            if pi["end"] < line_start or pi["start"] > line_end:
+                continue
+            overlap_start = max(pi["start"], line_start)
+            overlap_end = min(pi["end"], line_end)
+            nts_on_line = overlap_end - overlap_start + 1
+            total_probe_nts = pi["end"] - pi["start"] + 1
+            mid = (pi["start"] + pi["end"]) // 2
+
+            if pi["start"] >= line_start and pi["end"] <= line_end:
+                label_pos = mid
+            else:
+                nts_other = total_probe_nts - nts_on_line
+                if nts_on_line > nts_other:
+                    label_pos = (overlap_start + overlap_end) // 2
+                elif nts_on_line < nts_other:
+                    continue
+                else:
+                    if line_start <= pi["start"] or line_start < mid:
+                        label_pos = (overlap_start + overlap_end) // 2
+                    else:
+                        continue
+            labels.append((label_pos, pi["name"]))
+        return labels
+
+    def render_label_line(line_start, line_end, labels):
+        """Render a label line using invisible dashes for character-level alignment."""
+        n_nts = line_end - line_start + 1
+        n_groups = (n_nts + 9) // 10
+
+        # Build character array: all positions are invisible dashes (including separators)
+        chars = []
+        for g in range(n_groups):
+            group_size = min(10, n_nts - g * 10)
+            for _ in range(group_size):
+                chars.append(("p", "-"))
+            if g < n_groups - 1:
+                chars.append(("p", "-"))
+
+        total_visual = len(chars)
+
+        # Overlay labels at their center positions
+        for midpoint, name in labels:
+            char_offset = midpoint - line_start
+            visual_center = char_offset + char_offset // 10
+            label_start = visual_center - len(name) // 2
+
+            for i, ch in enumerate(name):
+                vpos = label_start + i
+                if 0 <= vpos < total_visual and chars[vpos][0] == "p":
+                    chars[vpos] = ("l", ch)
+
+        # Render by grouping consecutive same-type characters
+        parts = []
+        i = 0
+        while i < len(chars):
+            typ = chars[i][0]
+            j = i
+            while j < len(chars) and chars[j][0] == typ:
+                j += 1
+            text = "".join(chars[k][1] for k in range(i, j))
+            cls = "ll" if typ == "l" else "lp"
+            parts.append(f'<span class="{cls}">{text}</span>')
+            i = j
+
+        return "".join(parts)
+
+    def render_nucleotide_line(pos, line_end, for_copy=False):
+        """Render one line of nucleotides. Visual uses CSS classes, copy uses inline styles."""
+        parts = []
+        for group_start in range(pos, line_end + 1, 10):
+            group_end = min(group_start + 9, line_end)
+            for p in range(group_start, group_end + 1):
+                nt = sequence[p - 1]
+                is_utr = (cds_start and p < cds_start) or (cds_end and p > cds_end)
+
+                if for_copy:
+                    # Inline styles for rich text paste compatibility
+                    styles = "font-family:'Courier New',monospace;font-size:12px;"
+                    if p in probe_bg:
+                        styles += f"background:{'#e0e0e0' if is_utr else probe_bg[p]};"
+                    elif is_utr:
+                        styles += "background:#e0e0e0;"
+                    if p in mut_map:
+                        styles += f"color:{mut_map[p][0][1]};font-weight:bold;"
+                    parts.append(f'<span style="{styles}">{nt}</span>')
+                else:
+                    # CSS classes for visual HTML
+                    classes = ["s"]
+                    bg_style = ""
+                    if p in probe_bg:
+                        if is_utr:
+                            classes.append("su")
+                        else:
+                            bg_style = f' style="background:{probe_bg[p]}"'
+                    elif is_utr:
+                        classes.append("su")
+                    if p in mut_map:
+                        classes.append("sm")
+                        classes.append(f'sm-{mut_map[p][0][0]}')
+
+                    cls_str = " ".join(classes)
+                    if p in mut_map:
+                        tips = "; ".join(t for _, _, t in mut_map[p])
+                        tips_escaped = tips.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+                        parts.append(f'<span class="mutation-tip {cls_str}"{bg_style} data-tip="{tips_escaped}">{nt}</span>')
+                    else:
+                        parts.append(f'<span class="{cls_str}"{bg_style}>{nt}</span>')
+
+            if group_end < line_end:
+                if for_copy:
+                    parts.append('<span style="font-family:\'Courier New\',monospace;"> </span>')
+                else:
+                    parts.append('<span class="sg"> </span>')
+        return parts
+
+    # Build visual HTML
+    visual_parts = []
+    for exon_idx, (ex_start, ex_end) in enumerate(exon_bounds, 1):
+        visual_parts.append(
+            f'<div class="se">'
+            f'<div class="sh">'
+            f'Exon {exon_idx} (positions {ex_start}-{ex_end})</div>'
+        )
+        pos = ex_start
+        while pos <= ex_end:
+            line_end = min(pos + nts_per_line - 1, ex_end)
+
+            # Probe labels
+            labels = get_labels_for_line(pos, line_end)
+            if labels:
+                label_html = render_label_line(pos, line_end, labels)
+                visual_parts.append(f'<div class="sl">{label_html}</div>')
+            else:
+                visual_parts.append('<div class="sp"></div>')
+
+            # Nucleotides
+            nt_parts = render_nucleotide_line(pos, line_end, for_copy=False)
+            visual_parts.append('<div class="sn">' + "".join(nt_parts) + "</div>")
+            pos = line_end + 1
+
+        visual_parts.append("</div>")
+
+    # Build copy HTML
+    copy_parts = []
+    for exon_idx, (ex_start, ex_end) in enumerate(exon_bounds, 1):
+        exon_probes = []
+        for pi in probe_info:
+            if pi["end"] >= ex_start and pi["start"] <= ex_end:
+                exon_probes.append(pi["name"])
+        header = f"Exon {exon_idx} (positions {ex_start}-{ex_end}"
+        if exon_probes:
+            probe_nums = []
+            for pn in exon_probes:
+                parts = pn.split("-")
+                if len(parts) == 2:
+                    probe_nums.append(int(parts[1]))
+                else:
+                    probe_nums.append(pn)
+            if all(isinstance(n, int) for n in probe_nums):
+                probe_nums.sort()
+                if probe_nums[-1] - probe_nums[0] == len(probe_nums) - 1:
+                    header += f", probes {probe_nums[0]} to {probe_nums[-1]}"
+                else:
+                    header += f", probes {', '.join(str(n) for n in probe_nums)}"
+        header += ")"
+        copy_parts.append(
+            f'<div class="se">'
+            f'<div class="sh">{header}</div>'
+        )
+        pos = ex_start
+        while pos <= ex_end:
+            line_end = min(pos + copy_nts_per_line - 1, ex_end)
+            nt_parts = render_nucleotide_line(pos, line_end, for_copy=True)
+            copy_parts.append('<div class="sn">' + "".join(nt_parts) + "</div>")
+            pos = line_end + 1
+        copy_parts.append("</div>")
+        if exon_idx < len(exon_bounds):
+            copy_parts.append('<p style="margin:6px 0;">&nbsp;</p>')
+
+    return "\n".join(visual_parts), "\n".join(copy_parts)
+
+
+def write_mutations_file(mutations_df, output_path):
+    """Write the detailed mutations TSV file."""
+    cols = ["id", "mrna_position", "cdna_position", "clinical_significance",
+            "cdna_change", "protein_change", "clinvar_accession",
+            "chrom", "pos_start", "exon", "probe"]
+    out_df = mutations_df[[c for c in cols if c in mutations_df.columns]].copy()
+    out_df = out_df.rename(columns={
+        "mrna_position": "mRNA Position",
+        "cdna_position": "CDS Position",
+        "clinical_significance": "Significance",
+        "cdna_change": "cDNA Change",
+        "protein_change": "Protein Change",
+        "clinvar_accession": "ClinVar Accession",
+        "chrom": "Chrom",
+        "pos_start": "Genomic Pos",
+        "exon": "Exon",
+        "probe": "Probe",
+        "id": "ID",
+    })
+    out_df.to_csv(output_path, sep="\t", index=False)
 
 
 HTML_TEMPLATE = """\
@@ -173,6 +483,49 @@ tr:nth-child(even) { background-color: #f9f9f9; }
 .legend { display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 10px; font-size: 12px; }
 .legend-item { display: flex; align-items: center; gap: 5px; }
 .legend-dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+.annotated-seq { background: #fafafa; padding: 15px; border: 1px solid #ddd; border-radius: 4px; overflow-x: auto; }
+.seq-legend { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 10px; font-size: 12px; }
+.seq-legend-item { display: flex; align-items: center; gap: 5px; }
+.seq-legend-box { width: 20px; height: 14px; display: inline-block; border-radius: 2px; }
+.mutation-tip { cursor: help; position: relative; }
+.mutation-tip:hover::after {
+  content: attr(data-tip);
+  position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+  background: #2c3e50; color: white; padding: 6px 10px; border-radius: 4px;
+  font-size: 11px; white-space: nowrap; z-index: 100; pointer-events: none;
+  font-weight: normal; font-family: 'Segoe UI', Arial, sans-serif;
+  margin-bottom: 4px; max-width: 400px; white-space: normal; line-height: 1.4;
+}
+.s { font-family: 'Courier New', monospace; font-size: 12px; }
+.su { background: #e0e0e0; }
+.sm { font-weight: bold; }
+.sm-p { color: #e74c3c; }
+.sm-lp { color: #e67e22; }
+.sm-v { color: #f39c12; }
+.sm-b { color: #2ecc71; }
+.sm-lb { color: #27ae60; }
+.sm-o { color: #95a5a6; }
+.sg { font-family: 'Courier New', monospace; }
+.ll { font-family: 'Courier New', monospace; font-size: 12px; color: #2980b9; }
+.lp { font-family: 'Courier New', monospace; font-size: 12px; color: transparent; user-select: none; }
+.sl { height: 14px; white-space: pre; line-height: 1; }
+.sn { white-space: pre; }
+.se { margin: 15px 0; }
+.sh { font-weight: bold; color: #2c3e50; margin-bottom: 4px; }
+.sp { height: 14px; }
+.summary-info { margin-top: 15px; color: #7f8c8d; }
+.table-wrap { overflow-x: auto; }
+.copy-hidden { display: none; }
+.ld-p { background: #e74c3c; }
+.ld-lp { background: #e67e22; }
+.ld-v { background: #f39c12; }
+.ld-b { background: #2ecc71; }
+.ld-pr { background: rgba(52,152,219,0.5); }
+.slb-u { background: #e0e0e0; }
+.slb-po { background: #dee6ef; }
+.slb-pe { background: #ffffd7; }
+.slb-ov { background: #eef2e3; }
+.slm { color: #e74c3c; font-weight: bold; font-family: monospace; }
 </style>
 </head>
 <body>
@@ -195,9 +548,10 @@ tr:nth-child(even) { background-color: #f9f9f9; }
       <div class="label">Mutation Coverage ({{ n_covered }}/{{ n_unique_pos }})</div>
     </div>
   </div>
-  <p style="margin-top:15px; color:#7f8c8d;">
+  <p class="summary-info">
     Transcript: <b>{{ accession }}</b> &nbsp;|&nbsp;
     Sequence length: <b>{{ seq_len }}</b> nt &nbsp;|&nbsp;
+    CDS: <b>{{ cds_start }}-{{ cds_end }}</b> &nbsp;|&nbsp;
     Exons: <b>{{ n_exons }}</b> &nbsp;|&nbsp;
     Junctions: <b>{{ n_junctions }}</b>
   </p>
@@ -206,11 +560,11 @@ tr:nth-child(even) { background-color: #f9f9f9; }
 <div class="section">
   <h2>Transcript Map</h2>
   <div class="legend">
-    <div class="legend-item"><span class="legend-dot" style="background:#e74c3c;"></span> Pathogenic</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#e67e22;"></span> Likely pathogenic</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#f39c12;"></span> VUS</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#2ecc71;"></span> Benign/Likely benign</div>
-    <div class="legend-item"><span class="legend-dot" style="background:rgba(52,152,219,0.5);"></span> Probes</div>
+    <div class="legend-item"><span class="legend-dot ld-p"></span> Pathogenic</div>
+    <div class="legend-item"><span class="legend-dot ld-lp"></span> Likely pathogenic</div>
+    <div class="legend-item"><span class="legend-dot ld-v"></span> VUS</div>
+    <div class="legend-item"><span class="legend-dot ld-b"></span> Benign/Likely benign</div>
+    <div class="legend-item"><span class="legend-dot ld-pr"></span> Probes</div>
   </div>
   <div id="plotly-chart"></div>
   <script>
@@ -233,43 +587,88 @@ tr:nth-child(even) { background-color: #f9f9f9; }
       </select>
       entries
     </label>
+    <button class="btn btn-primary" onclick="downloadMutationsCSV()">Download CSV</button>
   </div>
+  <div class="table-wrap">
   <table id="mutation-table">
     <thead>
       <tr>
+        <th data-col="id">ID</th>
         <th data-col="protein_change">Protein Change</th>
         <th data-col="cdna_change">cDNA Change</th>
         <th data-col="clinical_significance">Significance</th>
         <th data-col="mrna_position">mRNA Position</th>
+        <th data-col="cdna_position">CDS Position</th>
         <th data-col="clinvar_accession">ClinVar Accession</th>
         <th data-col="chrom">Chrom</th>
         <th data-col="pos_start">Genomic Pos</th>
+        <th data-col="exon">Exon</th>
+        <th data-col="probe">Probe</th>
       </tr>
     </thead>
     <tbody id="mutation-tbody"></tbody>
   </table>
+  </div>
   <div class="pagination" id="mutation-pagination"></div>
 </div>
 
 <div class="section">
   <h2>Designed Probes</h2>
   <div class="controls">
-    <button class="btn btn-primary" onclick="downloadCSV()">Download CSV</button>
+    <input type="text" id="probe-search" placeholder="Search probes..." class="search-box">
+    <label>Show
+      <select id="probe-page-size" class="page-size-select">
+        <option value="10" selected>10</option>
+        <option value="25">25</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+        <option value="-1">All</option>
+      </select>
+      entries
+    </label>
+    <button class="btn btn-primary" onclick="downloadProbesCSV()">Download CSV</button>
   </div>
+  <div class="table-wrap">
   <table id="probe-table">
     <thead>
       <tr>
-        <th>Probe Name</th>
-        <th>Start</th>
-        <th>End</th>
-        <th>Length</th>
-        <th>Forward Oligo (5'->3')</th>
-        <th>Reverse Oligo (5'->3')</th>
-        <th>Mutations Covered</th>
+        <th data-col="probe_name">Probe Name</th>
+        <th data-col="mrna_start">mRNA Start</th>
+        <th data-col="mrna_end">mRNA End</th>
+        <th data-col="cds_start">CDS Start</th>
+        <th data-col="cds_end">CDS End</th>
+        <th data-col="length">Length</th>
+        <th data-col="target_sequence">Target</th>
+        <th data-col="fwd_oligo">Forward Oligo (5'->3')</th>
+        <th data-col="rev_oligo">Reverse Oligo (5'->3')</th>
+        <th data-col="mutations_covered">Mutations Covered</th>
+        <th data-col="cdna_changes_covered">cDNA Changes</th>
       </tr>
     </thead>
     <tbody id="probe-tbody"></tbody>
   </table>
+  </div>
+  <div class="pagination" id="probe-pagination"></div>
+</div>
+
+<div class="section">
+  <h2>Annotated mRNA Sequence</h2>
+  <div class="seq-legend">
+    <div class="seq-legend-item"><span class="seq-legend-box slb-u"></span> 5'/3' UTR</div>
+    <div class="seq-legend-item"><span class="slm">N</span> Mutation</div>
+    <div class="seq-legend-item"><span class="seq-legend-box slb-po"></span> Probe (odd)</div>
+    <div class="seq-legend-item"><span class="seq-legend-box slb-pe"></span> Probe (even)</div>
+    <div class="seq-legend-item"><span class="seq-legend-box slb-ov"></span> Probe overlap</div>
+  </div>
+  <div class="controls">
+    <button class="btn btn-primary" onclick="copyAnnotatedSequence()">Copy Sequence</button>
+  </div>
+  <div id="annotated-sequence" class="annotated-seq">
+    {{ annotated_html|safe }}
+  </div>
+  <div id="copy-sequence" class="copy-hidden">
+    {{ copy_html|safe }}
+  </div>
 </div>
 
 <div class="footer">Generated by gene-probe-design pipeline on {{ date }}</div>
@@ -284,6 +683,12 @@ let mutSortCol = null;
 let mutSortAsc = true;
 let filteredMutations = [...mutationsData];
 
+let probePage = 0;
+let probePageSize = 10;
+let probeSortCol = null;
+let probeSortAsc = true;
+let filteredProbes = [...probesData];
+
 function renderMutations() {
   const tbody = document.getElementById('mutation-tbody');
   const start = mutPageSize === -1 ? 0 : mutPage * mutPageSize;
@@ -291,9 +696,17 @@ function renderMutations() {
   const page = filteredMutations.slice(start, end);
 
   tbody.innerHTML = page.map(m => `<tr>
-    <td>${m.protein_change}</td><td>${m.cdna_change}</td>
-    <td>${m.clinical_significance}</td><td>${m.mrna_position}</td>
-    <td>${m.clinvar_accession}</td><td>${m.chrom}</td><td>${m.pos_start}</td>
+    <td>${m.id || ''}</td>
+    <td>${m.protein_change || ''}</td>
+    <td>${m.cdna_change || ''}</td>
+    <td>${m.clinical_significance || ''}</td>
+    <td>${m.mrna_position != null ? m.mrna_position : ''}</td>
+    <td>${m.cdna_position != null ? m.cdna_position : ''}</td>
+    <td>${m.clinvar_accession || ''}</td>
+    <td>${m.chrom || ''}</td>
+    <td>${m.pos_start || ''}</td>
+    <td>${m.exon || ''}</td>
+    <td>${m.probe || ''}</td>
   </tr>`).join('');
 
   const totalPages = mutPageSize === -1 ? 1 : Math.ceil(filteredMutations.length / mutPageSize);
@@ -304,11 +717,51 @@ function renderMutations() {
 }
 
 function renderProbes() {
-  document.getElementById('probe-tbody').innerHTML = probesData.map(p => `<tr>
-    <td>${p.probe_name}</td><td>${p.start}</td><td>${p.end}</td><td>${p.length}</td>
-    <td class="seq-cell">${p.fwd_oligo}</td><td class="seq-cell">${p.rev_oligo}</td>
-    <td>${p.mutations_covered.replace(/;/g, ', ')}</td>
+  const tbody = document.getElementById('probe-tbody');
+  const start = probePageSize === -1 ? 0 : probePage * probePageSize;
+  const end = probePageSize === -1 ? filteredProbes.length : start + probePageSize;
+  const page = filteredProbes.slice(start, end);
+
+  tbody.innerHTML = page.map(p => `<tr>
+    <td>${p.probe_name}</td>
+    <td>${p.mrna_start}</td><td>${p.mrna_end}</td>
+    <td>${p.cds_start}</td><td>${p.cds_end}</td>
+    <td>${p.length}</td>
+    <td class="seq-cell">${p.target_sequence}</td>
+    <td class="seq-cell">${p.fwd_oligo}</td>
+    <td class="seq-cell">${p.rev_oligo}</td>
+    <td>${p.mutations_covered}</td>
+    <td>${p.cdna_changes_covered}</td>
   </tr>`).join('');
+
+  const totalPages = probePageSize === -1 ? 1 : Math.ceil(filteredProbes.length / probePageSize);
+  const pag = document.getElementById('probe-pagination');
+  pag.innerHTML = `<span>Showing ${start+1}-${Math.min(end, filteredProbes.length)} of ${filteredProbes.length}</span> ` +
+    (probePage > 0 ? `<button class="btn btn-secondary" onclick="probePage--;renderProbes()">Prev</button>` : '') +
+    (probePage < totalPages - 1 ? `<button class="btn btn-secondary" onclick="probePage++;renderProbes()">Next</button>` : '');
+}
+
+function filterProbes() {
+  const q = document.getElementById('probe-search').value.toLowerCase();
+  filteredProbes = probesData.filter(p =>
+    Object.values(p).some(v => String(v).toLowerCase().includes(q))
+  );
+  probePage = 0;
+  renderProbes();
+}
+
+function sortProbes(col) {
+  if (probeSortCol === col) { probeSortAsc = !probeSortAsc; }
+  else { probeSortCol = col; probeSortAsc = true; }
+  filteredProbes.sort((a, b) => {
+    let va = a[col], vb = b[col];
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    if (typeof va === 'number') return probeSortAsc ? va - vb : vb - va;
+    return probeSortAsc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
+  });
+  probePage = 0;
+  renderProbes();
 }
 
 function filterMutations() {
@@ -325,6 +778,8 @@ function sortMutations(col) {
   else { mutSortCol = col; mutSortAsc = true; }
   filteredMutations.sort((a, b) => {
     let va = a[col], vb = b[col];
+    if (va == null) return 1;
+    if (vb == null) return -1;
     if (typeof va === 'number') return mutSortAsc ? va - vb : vb - va;
     return mutSortAsc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
   });
@@ -332,10 +787,30 @@ function sortMutations(col) {
   renderMutations();
 }
 
-function downloadCSV() {
-  const header = 'probe_name,FWD_name,REV_name,start,end,length,fwd_oligo,rev_oligo,mutations_covered,mutation_positions';
+function downloadMutationsCSV() {
+  const header = 'ID,Protein Change,cDNA Change,Significance,mRNA Position,CDS Position,ClinVar Accession,Chrom,Genomic Pos,Exon,Probe';
+  const rows = filteredMutations.map(m =>
+    [m.id||'', m.protein_change||'', m.cdna_change||'', m.clinical_significance||'',
+     m.mrna_position!=null?m.mrna_position:'', m.cdna_position!=null?m.cdna_position:'',
+     m.clinvar_accession||'', m.chrom||'', m.pos_start||'', m.exon||'', m.probe||'']
+    .map(v => '"'+String(v).replace(/"/g,'""')+'"').join(',')
+  );
+  const csv = header + '\\n' + rows.join('\\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '{{ gene }}_mutations.csv';
+  a.click();
+}
+
+function downloadProbesCSV() {
+  const header = 'probe_name,FWD_name,REV_name,mRNA_start,mRNA_end,CDS_start,CDS_end,length,target_sequence,fwd_oligo,rev_oligo,mutations_covered,cdna_changes_covered,mutation_positions';
   const rows = probesData.map(p =>
-    `${p.probe_name},${p.probe_name}-FWD,${p.probe_name}-REV,${p.start},${p.end},${p.length},${p.fwd_oligo},${p.rev_oligo},${p.mutations_covered},${p.mutation_positions}`
+    [p.probe_name, p.probe_name+'-FWD', p.probe_name+'-REV',
+     p.mrna_start, p.mrna_end, p.cds_start, p.cds_end, p.length,
+     p.target_sequence, p.fwd_oligo, p.rev_oligo,
+     p.mutations_covered, p.cdna_changes_covered, p.mutation_positions]
+    .map(v => '"'+String(v).replace(/"/g,'""')+'"').join(',')
   );
   const csv = header + '\\n' + rows.join('\\n');
   const blob = new Blob([csv], { type: 'text/csv' });
@@ -343,6 +818,46 @@ function downloadCSV() {
   a.href = URL.createObjectURL(blob);
   a.download = '{{ gene }}_probes.csv';
   a.click();
+}
+
+function copyAnnotatedSequence() {
+  const el = document.getElementById('copy-sequence');
+  // Temporarily show the hidden div so innerText works correctly
+  el.style.display = 'block';
+  el.style.position = 'absolute';
+  el.style.left = '-9999px';
+  const html = el.innerHTML;
+  const text = el.innerText;
+  el.style.display = 'none';
+  el.style.position = '';
+  el.style.left = '';
+  const blob = new Blob([html], { type: 'text/html' });
+  const textBlob = new Blob([text], { type: 'text/plain' });
+  if (navigator.clipboard && navigator.clipboard.write) {
+    navigator.clipboard.write([
+      new ClipboardItem({ 'text/html': blob, 'text/plain': textBlob })
+    ]).then(() => alert('Sequence copied with formatting!')).catch(() => {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      window.getSelection().removeAllRanges();
+      window.getSelection().addRange(range);
+      document.execCommand('copy');
+      alert('Sequence copied!');
+    });
+  } else {
+    el.style.display = 'block';
+    el.style.position = 'absolute';
+    el.style.left = '-9999px';
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+    document.execCommand('copy');
+    el.style.display = 'none';
+    el.style.position = '';
+    el.style.left = '';
+    alert('Sequence copied!');
+  }
 }
 
 document.getElementById('mutation-search').addEventListener('input', filterMutations);
@@ -353,6 +868,16 @@ document.getElementById('mutation-page-size').addEventListener('change', functio
 });
 document.querySelectorAll('#mutation-table th').forEach(th => {
   th.addEventListener('click', () => sortMutations(th.dataset.col));
+});
+
+document.getElementById('probe-search').addEventListener('input', filterProbes);
+document.getElementById('probe-page-size').addEventListener('change', function() {
+  probePageSize = parseInt(this.value);
+  probePage = 0;
+  renderProbes();
+});
+document.querySelectorAll('#probe-table th').forEach(th => {
+  th.addEventListener('click', () => sortProbes(th.dataset.col));
 });
 
 renderMutations();
@@ -366,7 +891,7 @@ renderProbes();
 def main():
     gene = snakemake.params.gene
 
-    mutations_df, sequence, accession, junctions_df, probes_df = load_data(
+    mutations_df, sequence, accession, cds_start, cds_end, junctions_df, probes_df = load_data(
         snakemake.input.mutations,
         snakemake.input.transcript,
         snakemake.input.junctions,
@@ -376,35 +901,47 @@ def main():
     seq_len = len(sequence)
     n_exons = len(junctions_df) + 1
 
-    # Compute coverage stats
-    all_positions = set(mutations_df["mrna_position"].tolist())
+    # Enrich mutations with computed fields
+    enriched_mutations = build_enriched_mutations(mutations_df, cds_start, junctions_df, probes_df)
+
+    # Compute coverage stats (only mutations with valid mRNA positions)
+    valid_mut = enriched_mutations[enriched_mutations["mrna_position"].notna()]
+    all_positions = set(valid_mut["mrna_position"].astype(int).tolist())
     covered_positions = set()
     for _, row in probes_df.iterrows():
-        for p in str(row["mutation_positions"]).split(";"):
-            covered_positions.add(int(p))
+        for p in str(row["mutation_positions"]).split(","):
+            if p.strip():
+                covered_positions.add(int(p.strip()))
     n_unique_pos = len(all_positions)
-    n_covered = len(covered_positions)
+    n_covered = len(covered_positions & all_positions)
     coverage_pct = f"{100 * n_covered / n_unique_pos:.1f}" if n_unique_pos else "0"
 
     log.info(
-        f"Report for {gene}: {len(mutations_df)} mutations, {len(probes_df)} probes, "
+        f"Report for {gene}: {len(enriched_mutations)} mutations, {len(probes_df)} probes, "
         f"{coverage_pct}% coverage"
     )
 
-    fig = build_plotly_figure(
-        mutations_df, accession, junctions_df, probes_df, seq_len
-    )
+    # Build Plotly figure
+    fig = build_plotly_figure(enriched_mutations, accession, junctions_df, probes_df, seq_len)
     plotly_json = fig.to_json()
 
-    mutations_json = mutations_df.to_json(orient="records")
+    # Build annotated sequence HTML
+    annotated_html, copy_html = build_annotated_sequence(
+        sequence, cds_start, cds_end, junctions_df, enriched_mutations, probes_df
+    )
+
+    # Serialize data for JavaScript
+    mutations_json = enriched_mutations.to_json(orient="records")
     probes_json = probes_df.to_json(orient="records")
 
-    from datetime import date
+    # Render HTML
     html = Template(HTML_TEMPLATE).render(
         gene=gene,
         accession=accession,
         seq_len=seq_len,
-        n_mutations=len(mutations_df),
+        cds_start=cds_start,
+        cds_end=cds_end,
+        n_mutations=len(enriched_mutations),
         n_probes=len(probes_df),
         n_exons=n_exons,
         n_junctions=len(junctions_df),
@@ -414,13 +951,18 @@ def main():
         plotly_json=plotly_json,
         mutations_json=mutations_json,
         probes_json=probes_json,
+        annotated_html=annotated_html,
+        copy_html=copy_html,
         date=date.today().isoformat(),
     )
 
-    with open(snakemake.output[0], "w") as f:
+    with open(snakemake.output.report, "w") as f:
         f.write(html)
+    log.info(f"Wrote report to {snakemake.output.report}")
 
-    log.info(f"Wrote report to {snakemake.output[0]}")
+    # Write detailed mutations file
+    write_mutations_file(enriched_mutations, snakemake.output.mutations_file)
+    log.info(f"Wrote mutations file to {snakemake.output.mutations_file}")
 
 
 if __name__ == "__main__":

@@ -17,13 +17,14 @@ config.yaml
 [fetch_clinvar] ──► data/{gene}/clinvar_mutations.tsv
     │                 data/{gene}/principal_transcript.txt
     ▼
-[fetch_transcript] ──► data/{gene}/transcript.tsv
+[fetch_transcript] ──► data/{gene}/transcript.tsv  (includes cds_start, cds_end)
     │                    data/{gene}/junctions.tsv
     ▼
-[design_probes] ──► data/{gene}/probes.tsv
+[design_probes] ──► data/{gene}/probes.tsv  (mrna_start/end + cds_start/end)
     │
     ├──► [generate_report] ──► results/{gene}/{gene}_report.html
-    └──► [export_probes]     ──► results/{gene}/probes.csv
+    │                          results/{gene}/{gene}_mutations.tsv
+    └──► [export_probes]     ──► results/{gene}/probes.tsv
 ```
 
 ## File Structure
@@ -38,9 +39,9 @@ pipeline/
     report.smk             # generate_report, export_probes
   scripts/
     fetch_clinvar.py       # NCBI E-utilities: esearch + esummary for ClinVar missense variants
-    fetch_transcript.py    # NCBI efetch GenBank record → sequence + exon junction extraction
-    design_probes.py       # Greedy probe placement algorithm
-    generate_report.py     # Jinja2 + Plotly interactive HTML report
+    fetch_transcript.py    # NCBI efetch GenBank record → sequence + exon junctions + CDS extraction
+    design_probes.py       # Greedy probe placement algorithm (converts cdna→mrna positions)
+    generate_report.py     # Jinja2 + Plotly interactive HTML report + annotated sequence
   envs/
     fetch.yaml             # biopython, requests, pandas
     design.yaml            # biopython, pandas
@@ -55,7 +56,8 @@ pipeline/
   results/                 # Final outputs per gene (gitignored)
     {gene}/
       {gene}_report.html
-      probes.csv
+      {gene}_mutations.tsv
+      probes.tsv
   logs/                    # Per-rule log files
 ```
 
@@ -82,6 +84,7 @@ snakemake --use-conda --cores 2
 snakemake data/POLR3A/clinvar_mutations.tsv --use-conda --cores 1
 snakemake data/POLR3A/probes.tsv --use-conda --cores 1
 snakemake results/POLR3A/POLR3A_report.html --use-conda --cores 1
+snakemake results/POLR3A/POLR3A_mutations.tsv --use-conda --cores 1
 
 # Generate DAG visualization
 snakemake --dag | dot -Tpng > dag.png
@@ -108,40 +111,58 @@ The principal transcript is auto-discovered from ClinVar data (most common NM_ a
 ## Data Sources (all NCBI E-utilities, fully programmatic)
 
 1. **ClinVar mutations**: `esearch` + `esummary` for missense variants
-   - Search term: `"{gene}"[Gene] AND single_gene[prop] AND "missense variant"[molecular_consequence]`
+   - Search term: `"{gene}"[Gene] AND "missense variant"[molecular_consequence]` (no `single_gene[prop]` — removed to get all variants)
    - Returns: protein change, cDNA change, clinical significance, genomic position, ClinVar accession
-   - mRNA position parsed from cDNA notation (`c.761G>A` → 761)
+   - cDNA position parsed from HGVS notation (`c.761G>A` → 761), stored as CDS-relative `cdna_position`
    - Batch esummary (200 IDs/call), rate limit 3 req/s without API key
+   - Pagination supports >5000 results via `retstart`
 
-2. **Transcript + exon structure**: Single GenBank `efetch` for NM_ accession
-   - Returns mRNA sequence AND exon features with mRNA-relative positions
+2. **Transcript + exon + CDS structure**: Single GenBank `efetch` for NM_ accession
+   - Returns mRNA sequence, exon features, and CDS feature with mRNA-relative positions
+   - CDS start/end extracted from the GenBank CDS feature (e.g., CDS starts at mRNA position 109 for POLR3A)
    - Junctions computed from consecutive exon boundaries (e.g., exon 1 ends at 152, exon 2 starts at 153 → junction at position 152)
 
 ## Intermediate File Formats
 
 ### `data/{gene}/clinvar_mutations.tsv`
-TSV with columns: `gene  transcript_id  protein_change  cdna_change  clinical_significance  chrom  pos_start  pos_end  clinvar_accession  mrna_position`
+TSV with columns: `gene  transcript_id  protein_change  cdna_change  clinical_significance  chrom  pos_start  pos_end  clinvar_accession  cdna_position`
+- `cdna_position` is the raw c.N value from HGVS cDNA notation (CDS-relative), NOT the absolute mRNA position
+- Records without a parseable cDNA position have empty `cdna_position`
 
 ### `data/{gene}/principal_transcript.txt`
 Single line: the auto-discovered NM_ accession (e.g., `NM_007055.4`)
 
 ### `data/{gene}/transcript.tsv`
-Key-value TSV: `field\tvalue` with rows: `accession`, `sequence_length`, `organism`, `sequence`
+Key-value TSV: `field\tvalue` with rows: `accession`, `sequence_length`, `organism`, `cds_start`, `cds_end`, `protein_start`, `sequence`
+- `cds_start`/`cds_end`: 1-based mRNA positions of the CDS (coding sequence start/end)
+- `protein_start`: first 30 amino acids of the protein translation (for verification)
 
 ### `data/{gene}/junctions.tsv`
 TSV with columns: `junction_id  mrna_position  exon_before  exon_after`
 - `mrna_position` is 1-based on the spliced mRNA
 
 ### `data/{gene}/probes.tsv`
-TSV with columns: `probe_name  start  end  length  target_sequence  fwd_oligo  rev_oligo  mutations_covered  mutation_positions`
+TSV with columns: `probe_name  mrna_start  mrna_end  cds_start  cds_end  length  target_sequence  fwd_oligo  rev_oligo  mutations_covered  cdna_changes_covered  mutation_positions`
+- `mrna_start`/`mrna_end`: absolute positions on the spliced mRNA (1-based)
+- `cds_start`/`cds_end`: CDS-relative positions (can be negative for 5' UTR probes)
+- `mutations_covered`: comma-separated protein changes
+- `cdna_changes_covered`: comma-separated cDNA change strings
+- `mutation_positions`: comma-separated mRNA positions
 - `fwd_oligo` = `AAAC` + reverse_complement(target_sequence)
 - `rev_oligo` = `AAAA` + target_sequence
 - `probe_name` format: `{GENE}-{N}` (e.g., `POLR3A-1`)
-- Mutations in semicolon-separated format
+
+## Coordinate System
+
+- **mRNA position**: 1-based absolute position on the spliced mRNA transcript (used for probe placement, transcript map)
+- **cDNA/CDS position** (`cdna_position`): the c.N value from HGVS notation, relative to the CDS start (c.1 = A of ATG start codon)
+- **Conversion**: `mrna_position = cds_start + cdna_position - 1`
+- `design_probes.py` reads `cds_start` from `transcript.tsv` and converts all positions before probe placement
+- CDS positions can be negative for probes covering the 5' UTR
 
 ## Probe Design Algorithm
 
-Greedy left-to-right sweep:
+Greedy left-to-right sweep (all positions are mRNA-based):
 1. Build forbidden zones: junction_buffer nt on each side of every exon-exon junction
 2. Sort mutations by mRNA position
 3. For each uncovered mutation:
@@ -159,19 +180,41 @@ Greedy left-to-right sweep:
 
 ## HTML Report
 
-Single self-contained file with Plotly CDN. Contains:
-- **Summary**: gene, transcript, mutation/probe counts, coverage %
+Single self-contained file with Plotly CDN. Uses CSS classes throughout (no inline styles in visual HTML except dynamic probe background colors). Contains:
+- **Summary**: gene, transcript, CDS range, mutation/probe counts, coverage %
 - **Interactive transcript map**: 3-lane Plotly chart (exons, mutations, probes) with hover tooltips
-- **Mutation table**: paginated (10/page), sortable, searchable, ClinVar details
-- **Probe table**: with CSV download button
+- **ClinVar Mutations table**: 11 columns (ID, Protein Change, cDNA Change, Significance, mRNA Position, CDS Position, ClinVar Accession, Chrom, Genomic Pos, Exon, Probe), paginated, sortable, searchable, with horizontal scrollbar and CSV download
+  - Mutation IDs use HGVS standard format: `NM_007055.4(POLR3A):c.251G>A` (transcript + gene in parentheses + cDNA change)
+  - Probe column deduplicates — multiple mutations at the same position show the probe name once
+- **Designed Probes table**: 11 columns (Probe Name, mRNA Start/End, CDS Start/End, Length, Target, FWD/REV Oligo, Mutations Covered, cDNA Changes), paginated (10/page default), sortable, searchable, with horizontal scrollbar and CSV download
+  - cDNA Changes column has no max-width constraint (removed `seq-cell` class) so full content is always visible
+- **Annotated mRNA Sequence**: exon blocks with labels, grey UTR backgrounds, colored mutation text with custom CSS tooltips (using `data-tip` attribute + `::after` pseudo-element for immediate display, `cursor: help`), probe regions shown as alternating colored backgrounds (`#dee6ef` for odd probes, `#ffffd7` for even probes, RGB-averaged blend `#eef2e3` where probes overlap), probe name labels centered at probe midpoints using invisible dash padding (`color: transparent; user-select: none`) in same 12px `'Courier New',monospace` font as nucleotides for exact character-level alignment, 100 nt per line in 10-nt groups
+- **Copy Sequence button**: copies from a hidden div formatted for paste (60 nt/row, rich text with inline styles for paste compatibility, exon headers include probe ranges like "Exon 2 (positions 153-288, probes 2 to 5)", no position numbers or probe labels in sequence)
+
+### Report CSS Classes
+
+The visual HTML uses CSS classes (defined in the `<style>` block) instead of inline styles:
+- **Nucleotides**: `.s` (base font), `.su` (UTR background), `.sm` (mutation bold), `.sm-p`/`.sm-lp`/`.sm-v`/`.sm-b`/`.sm-lb`/`.sm-o` (mutation color by significance), `.sg` (group separator)
+- **Labels**: `.ll` (visible label text), `.lp` (invisible transparent dash padding, `user-select: none`)
+- **Structure**: `.se` (exon container), `.sh` (exon header), `.sn` (nucleotide line), `.sl` (label line), `.sp` (empty spacer)
+- **Template**: `.summary-info`, `.table-wrap`, `.copy-hidden`, `.ld-*` (legend dots), `.slb-*` (seq legend boxes), `.slm` (seq legend mutation)
+- Probe backgrounds stay inline (`style="background:..."`) since they're dynamic hex values
+- The copy HTML retains full inline styles for rich text paste compatibility
+
+## Output Files
+
+- `results/{gene}/{gene}_report.html`: Interactive HTML report
+- `results/{gene}/probes.tsv`: Probe data (same columns as report probes table)
+- `results/{gene}/{gene}_mutations.tsv`: Detailed mutation data with all computed fields (same as CSV download from report)
 
 ## Known Limitations / Improvement Areas
 
 - ~9% of mutations cannot be covered (fall within junction buffer zones)
-- The CSV download in the report generates FWD/REV rows with `{probe_name}-FWD` and `{probe_name}-REV` naming
-- Mutations at the very 5' end (position < scan_offset) are skipped
+- Mutations at the very 5' end of the CDS (position < scan_offset from mRNA start) are skipped
 - The probe overlap penalty (−50) is a heuristic; may need tuning for edge cases
 - Report uses Plotly CDN — requires internet to load JS (data is embedded)
+- Some ClinVar records may lack a parseable cDNA position — these are kept in the mutations file but excluded from probe design
+- The Copy Sequence button uses Clipboard API which may not work in all browsers (falls back to execCommand)
 
 ## Reference Documents
 

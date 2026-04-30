@@ -36,6 +36,26 @@ def fetch_genbank(transcript_id: str, api_key: str) -> str:
     return resp.text
 
 
+def parse_cds_feature(gb_text: str) -> dict | None:
+    """Extract CDS start/end positions and translation from GenBank features.
+
+    Returns dict with 'start' (1-based mRNA position), 'end' (1-based inclusive),
+    and 'protein_start' (first 30 aa of translation), or None if no CDS found.
+    """
+    record = SeqIO.read(StringIO(gb_text), "genbank")
+    for feature in record.features:
+        if feature.type == "CDS":
+            cds_start = int(feature.location.start) + 1
+            cds_end = int(feature.location.end)
+            translation = feature.qualifiers.get("translation", [""])[0]
+            return {
+                "start": cds_start,
+                "end": cds_end,
+                "protein_start": translation[:30],
+            }
+    return None
+
+
 def parse_exon_features(gb_text: str) -> list[tuple[int, int]]:
     """Extract sorted exon (start, end) positions from GenBank features.
 
@@ -90,12 +110,26 @@ def main():
         f"Transcript: {accession}, length: {len(sequence)}, organism: {organism}"
     )
 
+    # Parse CDS feature
+    cds_info = parse_cds_feature(gb_text)
+    if cds_info:
+        log.info(
+            f"CDS: mRNA positions {cds_info['start']}-{cds_info['end']}, "
+            f"protein starts with {cds_info['protein_start']}"
+        )
+    else:
+        log.warning("No CDS feature found in GenBank record")
+
     # Write transcript TSV
     with open(output_transcript, "w") as f:
         f.write("field\tvalue\n")
         f.write(f"accession\t{accession}\n")
         f.write(f"sequence_length\t{len(sequence)}\n")
         f.write(f"organism\t{organism}\n")
+        if cds_info:
+            f.write(f"cds_start\t{cds_info['start']}\n")
+            f.write(f"cds_end\t{cds_info['end']}\n")
+            f.write(f"protein_start\t{cds_info['protein_start']}\n")
         f.write(f"sequence\t{sequence}\n")
     log.info(f"Wrote transcript to {output_transcript}")
 

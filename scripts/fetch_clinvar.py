@@ -24,11 +24,11 @@ BATCH_SIZE = 200
 
 def esearch_clinvar(gene: str, api_key: str) -> list[str]:
     """Search ClinVar for missense variants of a gene. Return list of UIDs."""
-    term = f'"{gene}"[Gene] AND single_gene[prop] AND "missense variant"[molecular_consequence]'
+    term = f'"{gene}"[Gene] AND "missense variant"[molecular_consequence]'
     params = {
         "db": "clinvar",
         "term": term,
-        "retmax": 5000,
+        "retmax": 0,
         "retmode": "json",
     }
     if api_key:
@@ -41,9 +41,26 @@ def esearch_clinvar(gene: str, api_key: str) -> list[str]:
     data = resp.json()
 
     count = int(data["esearchresult"]["count"])
-    ids = data["esearchresult"]["idlist"]
-    log.info(f"Found {count} ClinVar records, retrieved {len(ids)} IDs")
-    return ids
+    log.info(f"Found {count} total ClinVar records")
+
+    # Paginate to get all IDs
+    all_ids = []
+    retmax = 5000
+    for retstart in range(0, count, retmax):
+        params["retmax"] = retmax
+        params["retstart"] = retstart
+        resp = requests.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        batch_ids = data["esearchresult"]["idlist"]
+        all_ids.extend(batch_ids)
+        if api_key:
+            time.sleep(0.11)
+        else:
+            time.sleep(0.35)
+
+    log.info(f"Retrieved {len(all_ids)} IDs total")
+    return all_ids
 
 
 def esummary_batch(ids: list[str], api_key: str) -> list[dict]:
@@ -74,7 +91,10 @@ def esummary_batch(ids: list[str], api_key: str) -> list[dict]:
 
 
 def parse_cdna_position(cdna_change: str) -> int | None:
-    """Extract mRNA position from cDNA notation like 'c.761G>A' -> 761."""
+    """Extract cDNA position from HGVS notation like 'c.761G>A' -> 761.
+
+    Returns the c.N value (CDS-relative position), NOT the mRNA position.
+    """
     if not cdna_change:
         return None
     m = re.match(r"c\.(\d+)", cdna_change)
@@ -113,7 +133,7 @@ def parse_record(record: dict) -> dict | None:
 
     accession = record.get("accession", "")
 
-    mrna_pos = parse_cdna_position(cdna_change)
+    cdna_pos = parse_cdna_position(cdna_change)
 
     return {
         "gene": gene_symbol,
@@ -125,7 +145,7 @@ def parse_record(record: dict) -> dict | None:
         "pos_start": pos_start,
         "pos_end": pos_end,
         "clinvar_accession": accession,
-        "mrna_position": mrna_pos,
+        "cdna_position": cdna_pos,
     }
 
 
@@ -146,14 +166,22 @@ def main():
     log.info(f"Fetched {len(records)} summary records")
 
     parsed = []
+    dropped_no_transcript = 0
     transcript_counter = Counter()
     for rec in records:
         p = parse_record(rec)
-        if p and p["mrna_position"] is not None:
-            parsed.append(p)
-            transcript_counter[p["transcript_id"]] += 1
+        if not p:
+            dropped_no_transcript += 1
+            continue
+        parsed.append(p)
+        transcript_counter[p["transcript_id"]] += 1
 
-    log.info(f"Parsed {len(parsed)} records with valid mRNA positions")
+    n_with_cdna = sum(1 for p in parsed if p["cdna_position"] is not None)
+    log.info(
+        f"Parsed {len(parsed)} records ({n_with_cdna} with valid cDNA position, "
+        f"{len(parsed) - n_with_cdna} without). "
+        f"Dropped {dropped_no_transcript} records (no NM_ transcript in title)."
+    )
 
     if not parsed:
         log.error("No valid missense mutation records found")
@@ -165,8 +193,11 @@ def main():
         f"({transcript_counter[principal_transcript]}/{len(parsed)} records)"
     )
 
+    # Sort by cdna_position (records without go to the end)
     df = pd.DataFrame(parsed)
-    df = df.sort_values("mrna_position").reset_index(drop=True)
+    df = df.sort_values(
+        "cdna_position", na_position="last"
+    ).reset_index(drop=True)
     df.to_csv(output_mutations, sep="\t", index=False)
     log.info(f"Wrote {len(df)} mutations to {output_mutations}")
 
