@@ -22,6 +22,41 @@ molecular_consequences:
   - missense variant
   # - nonsense
 
+# Region targeting: which transcript regions to design probes for.
+# Controls which mutations are included and where probes can be placed.
+# Mutations outside the specified region are excluded from probe design
+# and the enriched mutations output.
+#
+# Values:
+#   "CDS"      - Only the coding sequence (default, backward compatible).
+#                Mutations in 5' UTR or 3' UTR are excluded.
+#
+#   "All"      - Entire transcript including 5' UTR and 3' UTR.
+#                All mutations are included regardless of position.
+#                UTR cDNA positions are parsed: c.-N (5' UTR) and c.*N (3' UTR).
+#
+#   Specific exons/regions - Comma-separated tokens. Only mutations and probes
+#                within the specified regions are included. Each token can be:
+#                  "5UTR"    - the 5' untranslated region
+#                  "3UTR"    - the 3' untranslated region
+#                  "N"       - a single exon number (e.g., "5")
+#                  "N-M"     - a range of exon numbers (e.g., "3-8")
+#                Exon numbers are validated against the actual transcript.
+#
+# Examples:
+#   region: "CDS"            # Default: coding sequence only
+#   region: "All"            # Full transcript including UTRs
+#   region: "5UTR,3-5"       # 5' UTR plus exons 3, 4, 5
+#   region: "1-4,8-10"       # Exons 1 through 4 and exons 8 through 10
+#   region: "5UTR,3UTR"      # Both UTRs but no CDS exons
+#   region: "5"              # Only exon 5
+#   region: "3-8"            # Exons 3 through 8
+#   region: "5UTR,CDS,3UTR"  # Entire transcript (same as "All")
+#   region: "5UTR,CDS"       # 5' UTR plus all CDS exons
+#   region: "CDS,3UTR"       # All CDS exons plus 3' UTR
+#
+region: "5-10,15-25,3UTR"
+
 probe_params:
   target_length: 25
   min_length: 24

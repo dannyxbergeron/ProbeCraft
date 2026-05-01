@@ -7,8 +7,10 @@ rule generate_report:
     output:
         report="results/{gene}/{gene}_report.html",
         mutations_file="results/{gene}/{gene}_mutations.tsv",
+        idt_order="results/{gene}/IDT_order.tsv",
     params:
         gene="{gene}",
+        region=config.get("region", "CDS"),
     log: "logs/generate_report/{gene}.log"
     conda: "../envs/report.yaml"
     script: "../scripts/generate_report.py"

@@ -57,6 +57,98 @@ def build_forbidden_zones(junctions: list[int], buffer: int) -> list[tuple[int, 
     return merge_intervals(zones)
 
 
+def compute_probe_exon(mrna_start: int, mrna_end: int,
+                       junction_positions: list[int],
+                       cds_mrna_start: int, cds_mrna_end: int) -> str:
+    """Determine the exon label for a probe based on its midpoint."""
+    mid = (mrna_start + mrna_end) // 2
+    if mid < cds_mrna_start:
+        return "5UTR"
+    if mid > cds_mrna_end:
+        return "3UTR"
+    for i, jpos in enumerate(junction_positions):
+        if mid <= jpos:
+            return str(i + 1)
+    return str(len(junction_positions) + 1)
+
+
+def parse_region_config(region_str: str) -> list[str]:
+    """Parse region config string into list of region tokens.
+
+    Examples:
+        "CDS"       -> ["CDS"]
+        "All"       -> ["All"]
+        "5"         -> ["5"]
+        "3-8"       -> ["3", "4", "5", "6", "7", "8"]
+        "1-4,8-10"  -> ["1", "2", "3", "4", "8", "9", "10"]
+        "5UTR,3-5"  -> ["5UTR", "3", "4", "5"]
+    """
+    tokens = []
+    for token in region_str.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token in ("5UTR", "3UTR", "CDS", "All"):
+            tokens.append(token)
+        elif "-" in token:
+            parts = token.split("-")
+            start, end = int(parts[0]), int(parts[1])
+            for n in range(start, end + 1):
+                tokens.append(str(n))
+        else:
+            tokens.append(token)
+    return tokens
+
+
+def build_exon_boundaries(junction_positions: list[int], seq_len: int) -> list[tuple[int, int]]:
+    """Build exon boundary list [(start, end), ...] from junction positions."""
+    bounds = []
+    prev_end = 0
+    for jpos in junction_positions:
+        bounds.append((prev_end + 1, jpos))
+        prev_end = jpos
+    bounds.append((prev_end + 1, seq_len))
+    return bounds
+
+
+def mrna_ranges_for_regions(region_tokens: list[str],
+                            junction_positions: list[int],
+                            seq_len: int,
+                            cds_mrna_start: int,
+                            cds_mrna_end: int) -> list[tuple[int, int]]:
+    """Convert region tokens to mRNA position ranges.
+
+    Returns list of (start, end) 1-based inclusive ranges on the mRNA.
+    Raises ValueError for out-of-range exon numbers.
+    """
+    n_exons = len(junction_positions) + 1
+    exon_bounds = build_exon_boundaries(junction_positions, seq_len)
+
+    ranges = []
+    for token in set(region_tokens):
+        if token == "5UTR":
+            if cds_mrna_start > 1:
+                ranges.append((1, cds_mrna_start - 1))
+        elif token == "3UTR":
+            if cds_mrna_end < seq_len:
+                ranges.append((cds_mrna_end + 1, seq_len))
+        elif token == "CDS":
+            ranges.append((cds_mrna_start, cds_mrna_end))
+        elif token == "All":
+            ranges.append((1, seq_len))
+        else:
+            exon_num = int(token)
+            if exon_num < 1 or exon_num > n_exons:
+                raise ValueError(
+                    f"Exon {exon_num} is out of range. "
+                    f"Transcript has {n_exons} exons (1-{n_exons}). "
+                    f"Please update the 'region' setting in config.yaml."
+                )
+            ranges.append(exon_bounds[exon_num - 1])
+
+    return merge_intervals(ranges)
+
+
 def design_probes(
     mutation_positions: list[int],
     mutation_labels: list[str],
@@ -70,11 +162,23 @@ def design_probes(
     scan_offset: int,
     gene: str,
     cds_mrna_start: int,
+    cds_mrna_end: int,
+    region_tokens: list[str] | None = None,
 ) -> list[dict]:
     forbidden = build_forbidden_zones(junction_positions, junction_buffer)
     log.info(f"Forbidden zones: {forbidden}")
 
     seq_len = len(sequence)
+
+    # Build allowed zones from region config
+    if region_tokens is not None:
+        allowed = mrna_ranges_for_regions(
+            region_tokens, junction_positions, seq_len,
+            cds_mrna_start, cds_mrna_end,
+        )
+        log.info(f"Region allowed zones: {allowed}")
+    else:
+        allowed = [(1, seq_len)]
     uncovered = set(range(len(mutation_positions)))
     probes = []
     probe_counter = 0
@@ -105,6 +209,13 @@ def design_probes(
                     continue
 
                 if overlaps_any(probe_start, probe_end, forbidden):
+                    continue
+
+                # Check if probe falls within allowed regions
+                if not any(
+                    probe_start >= a_start and probe_end <= a_end
+                    for a_start, a_end in allowed
+                ):
                     continue
 
                 covered = [
@@ -168,8 +279,13 @@ def design_probes(
         cds_start = mrna_start - cds_mrna_start + 1
         cds_end = mrna_end - cds_mrna_start + 1
 
+        exon_label = compute_probe_exon(
+            mrna_start, mrna_end, junction_positions,
+            cds_mrna_start, cds_mrna_end,
+        )
+
         probes.append({
-            "probe_name": f"{gene}-{probe_counter}",
+            "probe_name": f"{gene}-{exon_label}-{probe_counter}",
             "mrna_start": mrna_start,
             "mrna_end": mrna_end,
             "cds_start": cds_start,
@@ -181,6 +297,7 @@ def design_probes(
             "mutations_covered": ",".join(covered_mutations),
             "cdna_changes_covered": ",".join(covered_cdna),
             "mutation_positions": ",".join(str(p) for p in covered_positions),
+            "exon": exon_label,
         })
 
         uncovered -= set(covered_idxs)
@@ -195,6 +312,7 @@ def main():
     max_len = snakemake.params.max_length
     junction_buffer = snakemake.params.junction_buffer
     scan_offset = snakemake.params.scan_offset
+    region_config = snakemake.params.region
 
     mutations_df = pd.read_csv(snakemake.input.mutations, sep="\t")
     transcript_df = pd.read_csv(snakemake.input.transcript, sep="\t")
@@ -211,11 +329,29 @@ def main():
     cds_mrna_start = int(cds_start_row.values[0])
     log.info(f"CDS starts at mRNA position {cds_mrna_start}")
 
-    # Convert cdna_position to mrna_position
-    # cdna_position is the c.N value (CDS-relative), mrna_position is absolute on the transcript
+    # Read CDS end from transcript.tsv
+    cds_end_row = transcript_df.loc[transcript_df["field"] == "cds_end", "value"]
+    if cds_end_row.empty:
+        log.error("No cds_end found in transcript.tsv — re-run fetch_transcript")
+        sys.exit(1)
+    cds_mrna_end = int(cds_end_row.values[0])
+    log.info(f"CDS ends at mRNA position {cds_mrna_end}")
+
+    # Convert cdna_position to mrna_position, handling UTR
     mutations_with_pos = mutations_df[mutations_df["cdna_position"].notna()].copy()
     mutations_with_pos["cdna_position"] = mutations_with_pos["cdna_position"].astype(int)
-    mutations_with_pos["mrna_position"] = mutations_with_pos["cdna_position"] + cds_mrna_start - 1
+
+    def cdna_to_mrna(row):
+        cdna_type = row.get("cdna_type")
+        cdna_pos = int(row["cdna_position"])
+        if cdna_type == "5UTR":
+            return cds_mrna_start - cdna_pos
+        elif cdna_type == "3UTR":
+            return cds_mrna_end + cdna_pos
+        else:
+            return cdna_pos + cds_mrna_start - 1
+
+    mutations_with_pos["mrna_position"] = mutations_with_pos.apply(cdna_to_mrna, axis=1)
 
     n_total = len(mutations_df)
     n_without_cdna = n_total - len(mutations_with_pos)
@@ -224,6 +360,29 @@ def main():
             f"{n_without_cdna}/{n_total} mutations have no valid cDNA position — "
             f"excluded from probe design"
         )
+
+    # Filter mutations by region config
+    if region_config and region_config != "All":
+        region_tokens = parse_region_config(region_config)
+        allowed_ranges = mrna_ranges_for_regions(
+            region_tokens, junction_positions, len(sequence),
+            cds_mrna_start, cds_mrna_end,
+        )
+        n_before = len(mutations_with_pos)
+
+        def mutation_in_region(mrna_pos):
+            return any(s <= mrna_pos <= e for s, e in allowed_ranges)
+
+        mutations_with_pos = mutations_with_pos[
+            mutations_with_pos["mrna_position"].apply(mutation_in_region)
+        ]
+        n_after = len(mutations_with_pos)
+        if n_after < n_before:
+            log.info(
+                f"Region filter '{region_config}': kept {n_after}/{n_before} mutations"
+            )
+    else:
+        region_tokens = None
 
     mutations_with_pos["protein_change"] = mutations_with_pos["protein_change"].fillna("")
     mutations_with_pos["cdna_change"] = mutations_with_pos["cdna_change"].fillna("")
@@ -250,6 +409,8 @@ def main():
         scan_offset=scan_offset,
         gene=gene,
         cds_mrna_start=cds_mrna_start,
+        cds_mrna_end=cds_mrna_end,
+        region_tokens=region_tokens,
     )
 
     log.info(f"Designed {len(probes)} probes")
@@ -259,10 +420,13 @@ def main():
         for pos_str in p["mutation_positions"].split(","):
             covered.add(int(pos_str))
     total = set(mutation_positions)
-    log.info(
-        f"Coverage: {len(covered)}/{len(total)} mutations "
-        f"({100 * len(covered) / len(total):.1f}%)"
-    )
+    if total:
+        log.info(
+            f"Coverage: {len(covered)}/{len(total)} mutations "
+            f"({100 * len(covered) / len(total):.1f}%)"
+        )
+    else:
+        log.info("No mutations with valid positions — no probes designed")
 
     probes_df = pd.DataFrame(probes)
     probes_df.to_csv(snakemake.output[0], sep="\t", index=False)

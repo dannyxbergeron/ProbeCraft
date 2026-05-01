@@ -12,6 +12,7 @@ rule design_probes:
         max_length=config["probe_params"]["max_length"],
         junction_buffer=config["probe_params"]["junction_buffer"],
         scan_offset=config["probe_params"]["scan_offset"],
+        region=config.get("region", "CDS"),
     log: "logs/design_probes/{gene}.log"
     conda: "../envs/design.yaml"
     script: "../scripts/design_probes.py"

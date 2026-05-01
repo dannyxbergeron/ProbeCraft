@@ -54,24 +54,114 @@ def load_data(mutations_path, transcript_path, junctions_path, probes_path):
     return mutations_df, sequence, accession, cds_start, cds_end, junctions_df, probes_df
 
 
-def compute_exon_number(mrna_pos, junctions_df):
-    """Determine which exon a mRNA position falls in."""
+def compute_exon_number(mrna_pos, junctions_df, cds_start=None, cds_end=None):
+    """Determine which exon a mRNA position falls in.
+
+    Returns numeric exon string, or '5UTR'/'3UTR' for UTR positions.
+    """
     if pd.isna(mrna_pos):
         return ""
     pos = int(mrna_pos)
+    if cds_start and pos < cds_start:
+        return "5UTR"
+    if cds_end and pos > cds_end:
+        return "3UTR"
     junction_positions = junctions_df["mrna_position"].tolist()
     for i, jpos in enumerate(junction_positions):
         if pos <= jpos:
-            return i + 1
-    return len(junction_positions) + 1
+            return str(i + 1)
+    return str(len(junction_positions) + 1)
 
 
-def build_enriched_mutations(mutations_df, cds_start, junctions_df, probes_df):
+def _parse_region_config(region_str):
+    """Parse region config string into list of region tokens."""
+    tokens = []
+    for token in region_str.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token in ("5UTR", "3UTR", "CDS", "All"):
+            tokens.append(token)
+        elif "-" in token:
+            parts = token.split("-")
+            start, end = int(parts[0]), int(parts[1])
+            for n in range(start, end + 1):
+                tokens.append(str(n))
+        else:
+            tokens.append(token)
+    return tokens
+
+
+def _mrna_ranges_for_regions(region_tokens, junction_positions, seq_len,
+                              cds_start, cds_end):
+    """Convert region tokens to mRNA position ranges."""
+    n_exons = len(junction_positions) + 1
+    exon_bounds = []
+    prev_end = 0
+    for jpos in junction_positions:
+        exon_bounds.append((prev_end + 1, jpos))
+        prev_end = jpos
+    exon_bounds.append((prev_end + 1, seq_len))
+
+    ranges = []
+    for token in set(region_tokens):
+        if token == "5UTR":
+            if cds_start > 1:
+                ranges.append((1, cds_start - 1))
+        elif token == "3UTR":
+            if cds_end < seq_len:
+                ranges.append((cds_end + 1, seq_len))
+        elif token == "CDS":
+            ranges.append((cds_start, cds_end))
+        elif token == "All":
+            ranges.append((1, seq_len))
+        else:
+            exon_num = int(token)
+            if exon_num < 1 or exon_num > n_exons:
+                raise ValueError(
+                    f"Exon {exon_num} is out of range. "
+                    f"Transcript has {n_exons} exons (1-{n_exons}). "
+                    f"Please update the 'region' setting in config.yaml."
+                )
+            ranges.append(exon_bounds[exon_num - 1])
+
+    # Merge overlapping ranges
+    if not ranges:
+        return []
+    sorted_iv = sorted(ranges)
+    merged = [sorted_iv[0]]
+    for start, end in sorted_iv[1:]:
+        if start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def build_enriched_mutations(mutations_df, cds_start, cds_end, junctions_df,
+                             probes_df):
     """Add computed columns to mutations: mrna_position, exon, probe_name, id."""
     df = mutations_df.copy()
 
-    # Compute mRNA position from cdna_position
-    if cds_start and "cdna_position" in df.columns:
+    # Compute mRNA position from cdna_position, handling UTR
+    if cds_start and cds_end and "cdna_position" in df.columns:
+        has_pos = df["cdna_position"].notna()
+        pos_df = df[has_pos].copy()
+        pos_df["cdna_position"] = pos_df["cdna_position"].astype(int)
+
+        def _cdna_to_mrna(row):
+            cdna_type = row.get("cdna_type")
+            cdna_pos = int(row["cdna_position"])
+            if cdna_type == "5UTR":
+                return cds_start - cdna_pos
+            elif cdna_type == "3UTR":
+                return cds_end + cdna_pos
+            else:
+                return cdna_pos + cds_start - 1
+
+        df.loc[has_pos, "mrna_position"] = pos_df.apply(_cdna_to_mrna, axis=1)
+        df.loc[~has_pos, "mrna_position"] = None
+    elif cds_start and "cdna_position" in df.columns:
         has_pos = df["cdna_position"].notna()
         df.loc[has_pos, "mrna_position"] = (
             df.loc[has_pos, "cdna_position"].astype(int) + cds_start - 1
@@ -85,7 +175,7 @@ def build_enriched_mutations(mutations_df, cds_start, junctions_df, probes_df):
 
     # Exon number
     df["exon"] = df["mrna_position"].apply(
-        lambda p: compute_exon_number(p, junctions_df)
+        lambda p: compute_exon_number(p, junctions_df, cds_start, cds_end)
     )
 
     # Probe name: which probe covers this mutation
@@ -397,9 +487,11 @@ def build_annotated_sequence(sequence, cds_start, cds_end, junctions_df, mutatio
             probe_nums = []
             for pn in exon_probes:
                 parts = pn.split("-")
-                if len(parts) == 2:
-                    probe_nums.append(int(parts[1]))
-                else:
+                # New format: {gene}-{exon}-{N} -> last part is the number
+                last_part = parts[-1]
+                try:
+                    probe_nums.append(int(last_part))
+                except ValueError:
                     probe_nums.append(pn)
             if all(isinstance(n, int) for n in probe_nums):
                 probe_nums.sort()
@@ -633,6 +725,7 @@ tr:nth-child(even) { background-color: #f9f9f9; }
     <thead>
       <tr>
         <th data-col="probe_name">Probe Name</th>
+        <th data-col="exon">Exon</th>
         <th data-col="mrna_start">mRNA Start</th>
         <th data-col="mrna_end">mRNA End</th>
         <th data-col="cds_start">CDS Start</th>
@@ -724,6 +817,7 @@ function renderProbes() {
 
   tbody.innerHTML = page.map(p => `<tr>
     <td>${p.probe_name}</td>
+    <td>${p.exon || ''}</td>
     <td>${p.mrna_start}</td><td>${p.mrna_end}</td>
     <td>${p.cds_start}</td><td>${p.cds_end}</td>
     <td>${p.length}</td>
@@ -804,9 +898,9 @@ function downloadMutationsCSV() {
 }
 
 function downloadProbesCSV() {
-  const header = 'probe_name,FWD_name,REV_name,mRNA_start,mRNA_end,CDS_start,CDS_end,length,target_sequence,fwd_oligo,rev_oligo,mutations_covered,cdna_changes_covered,mutation_positions';
+  const header = 'probe_name,exon,FWD_name,REV_name,mRNA_start,mRNA_end,CDS_start,CDS_end,length,target_sequence,fwd_oligo,rev_oligo,mutations_covered,cdna_changes_covered,mutation_positions';
   const rows = probesData.map(p =>
-    [p.probe_name, p.probe_name+'-FWD', p.probe_name+'-REV',
+    [p.probe_name, p.exon||'', p.probe_name+'-FWD', p.probe_name+'-REV',
      p.mrna_start, p.mrna_end, p.cds_start, p.cds_end, p.length,
      p.target_sequence, p.fwd_oligo, p.rev_oligo,
      p.mutations_covered, p.cdna_changes_covered, p.mutation_positions]
@@ -890,6 +984,7 @@ renderProbes();
 
 def main():
     gene = snakemake.params.gene
+    region_config = snakemake.params.region
 
     mutations_df, sequence, accession, cds_start, cds_end, junctions_df, probes_df = load_data(
         snakemake.input.mutations,
@@ -902,7 +997,32 @@ def main():
     n_exons = len(junctions_df) + 1
 
     # Enrich mutations with computed fields
-    enriched_mutations = build_enriched_mutations(mutations_df, cds_start, junctions_df, probes_df)
+    enriched_mutations = build_enriched_mutations(
+        mutations_df, cds_start, cds_end, junctions_df, probes_df,
+    )
+
+    # Filter mutations by region config
+    if region_config and region_config != "All":
+        junction_positions = junctions_df["mrna_position"].tolist()
+        region_tokens = _parse_region_config(region_config)
+        allowed_ranges = _mrna_ranges_for_regions(
+            region_tokens, junction_positions, seq_len, cds_start, cds_end,
+        )
+
+        def _in_region(mrna_pos):
+            if pd.isna(mrna_pos):
+                return False
+            return any(s <= mrna_pos <= e for s, e in allowed_ranges)
+
+        n_before = len(enriched_mutations)
+        enriched_mutations = enriched_mutations[
+            enriched_mutations["mrna_position"].apply(_in_region)
+        ]
+        n_after = len(enriched_mutations)
+        if n_after < n_before:
+            log.info(
+                f"Region filter '{region_config}': kept {n_after}/{n_before} mutations in report"
+            )
 
     # Compute coverage stats (only mutations with valid mRNA positions)
     valid_mut = enriched_mutations[enriched_mutations["mrna_position"].notna()]
@@ -963,6 +1083,20 @@ def main():
     # Write detailed mutations file
     write_mutations_file(enriched_mutations, snakemake.output.mutations_file)
     log.info(f"Wrote mutations file to {snakemake.output.mutations_file}")
+
+    # Write IDT order file
+    if hasattr(snakemake.output, "idt_order") and snakemake.output.idt_order:
+        idt_rows = []
+        for _, prow in probes_df.iterrows():
+            idt_rows.append({
+                "Probe_name_fwd": f"{prow['probe_name']}-FWD",
+                "fwd_seq": prow["fwd_oligo"],
+                "Probe_name_rev": f"{prow['probe_name']}-REV",
+                "rev_seq": prow["rev_oligo"],
+            })
+        idt_df = pd.DataFrame(idt_rows)
+        idt_df.to_csv(snakemake.output.idt_order, sep="\t", index=False)
+        log.info(f"Wrote IDT order file to {snakemake.output.idt_order}")
 
 
 if __name__ == "__main__":

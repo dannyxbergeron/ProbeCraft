@@ -9,3 +9,4 @@ rule all:
         expand("results/{gene}/{gene}_report.html", gene=config["genes"]),
         expand("results/{gene}/probes.tsv", gene=config["genes"]),
         expand("results/{gene}/{gene}_mutations.tsv", gene=config["genes"]),
+        expand("results/{gene}/IDT_order.tsv", gene=config["genes"]),

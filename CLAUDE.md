@@ -24,6 +24,7 @@ config.yaml
     │
     ├──► [generate_report] ──► results/{gene}/{gene}_report.html
     │                          results/{gene}/{gene}_mutations.tsv
+    │                          results/{gene}/IDT_order.tsv
     └──► [export_probes]     ──► results/{gene}/probes.tsv
 ```
 
@@ -58,6 +59,7 @@ pipeline/
       {gene}_report.html
       {gene}_mutations.tsv
       probes.tsv
+      IDT_order.tsv
   logs/                    # Per-rule log files
 ```
 
@@ -101,6 +103,9 @@ ncbi_api_key: ""    # Optional: 10 req/s with key, 3 req/s without
 molecular_consequences:               # ClinVar consequence filter — list, single value, or "all"
   - missense variant                   # Default if key omitted
 
+region: "CDS"            # Region targeting: "CDS", "All", or specific exons/UTRs
+                         # See Region Targeting section below
+
 probe_params:
   target_length: 25       # Ideal probe size (nt)
   min_length: 24           # Min acceptable
@@ -119,7 +124,9 @@ The principal transcript is auto-discovered from ClinVar data (most common NM_ a
    - Multiple values are combined with OR in the esearch query
    - Valid ClinVar values: missense variant, intron variant, synonymous variant, non-coding transcript variant, frameshift variant, 5 prime UTR variant, 3 prime UTR variant, nonsense, splice donor variant, splice acceptor variant, inframe deletion, inframe insertion, initiator codon variant, inframe indel, stop lost, genic upstream transcript variant, genic downstream transcript variant, no sequence alteration
    - Returns: protein change, cDNA change, clinical significance, genomic position, ClinVar accession
-   - cDNA position parsed from HGVS notation (`c.761G>A` → 761), stored as CDS-relative `cdna_position`
+   - cDNA position parsed from HGVS notation (`c.761G>A` → 761), stored as CDS-relative `cdna_position`; also parses UTR positions (`c.-5` → 5' UTR, `c.*5` → 3' UTR) with `cdna_type` column
+   - ClinVar `cdna_change` field may contain short form (`c.3G>T`) or full HGVS form (`NM_007055.4(POLR3A):c.-15C>T`); parser uses `re.search` to handle both
+   - UTR consequence types (`5 prime UTR variant`, `3 prime UTR variant`) are automatically added to the ClinVar query when `region` includes "5UTR", "3UTR", or "All" — no need to add them manually to `molecular_consequences`
    - Batch esummary (200 IDs/call), rate limit 3 req/s without API key
    - Rate limiting: 0.5s delay between requests without API key (0.11s with key), with exponential backoff retry (up to 5 retries) on 429 errors — handles parallel multi-gene runs
    - Pagination supports >5000 results via `retstart`
@@ -132,9 +139,10 @@ The principal transcript is auto-discovered from ClinVar data (most common NM_ a
 ## Intermediate File Formats
 
 ### `data/{gene}/clinvar_mutations.tsv`
-TSV with columns: `gene  transcript_id  protein_change  cdna_change  clinical_significance  chrom  pos_start  pos_end  clinvar_accession  cdna_position`
+TSV with columns: `gene  transcript_id  protein_change  cdna_change  clinical_significance  chrom  pos_start  pos_end  clinvar_accession  cdna_position  cdna_type`
 - `cdna_position` is the raw c.N value from HGVS cDNA notation (CDS-relative), NOT the absolute mRNA position
-- Records without a parseable cDNA position have empty `cdna_position`
+- `cdna_type` classifies the position: "CDS" (c.N), "5UTR" (c.-N), "3UTR" (c.*N), or empty
+- Records without a parseable cDNA position have empty `cdna_position` and `cdna_type`
 
 ### `data/{gene}/principal_transcript.txt`
 Single line: the auto-discovered NM_ accession (e.g., `NM_007055.4`)
@@ -149,7 +157,7 @@ TSV with columns: `junction_id  mrna_position  exon_before  exon_after`
 - `mrna_position` is 1-based on the spliced mRNA
 
 ### `data/{gene}/probes.tsv`
-TSV with columns: `probe_name  mrna_start  mrna_end  cds_start  cds_end  length  target_sequence  fwd_oligo  rev_oligo  mutations_covered  cdna_changes_covered  mutation_positions`
+TSV with columns: `probe_name  mrna_start  mrna_end  cds_start  cds_end  length  target_sequence  fwd_oligo  rev_oligo  mutations_covered  cdna_changes_covered  mutation_positions  exon`
 - `mrna_start`/`mrna_end`: absolute positions on the spliced mRNA (1-based)
 - `cds_start`/`cds_end`: CDS-relative positions (can be negative for 5' UTR probes)
 - `mutations_covered`: comma-separated protein changes (empty string if variant has no protein change, e.g. nonsense)
@@ -157,33 +165,52 @@ TSV with columns: `probe_name  mrna_start  mrna_end  cds_start  cds_end  length 
 - `mutation_positions`: comma-separated mRNA positions
 - `fwd_oligo` = `AAAC` + reverse_complement(target_sequence)
 - `rev_oligo` = `AAAA` + target_sequence
-- `probe_name` format: `{GENE}-{N}` (e.g., `POLR3A-1`)
+- `probe_name` format: `{GENE}-{exon}-{N}` (e.g., `POLR3A-5-1`, `POLR3A-5UTR-3`)
+- `exon`: exon label — numeric for CDS exons (e.g., "5"), or "5UTR"/"3UTR" for UTR probes
 
 ## Coordinate System
 
 - **mRNA position**: 1-based absolute position on the spliced mRNA transcript (used for probe placement, transcript map)
 - **cDNA/CDS position** (`cdna_position`): the c.N value from HGVS notation, relative to the CDS start (c.1 = A of ATG start codon)
-- **Conversion**: `mrna_position = cds_start + cdna_position - 1`
-- `design_probes.py` reads `cds_start` from `transcript.tsv` and converts all positions before probe placement
+- **Conversion**: depends on `cdna_type`:
+  - CDS: `mrna_position = cds_start + cdna_position - 1`
+  - 5' UTR (c.-N): `mrna_position = cds_start - cdna_position`
+  - 3' UTR (c.*N): `mrna_position = cds_end + cdna_position`
+- `design_probes.py` reads `cds_start` and `cds_end` from `transcript.tsv` and converts all positions before probe placement
 - CDS positions can be negative for probes covering the 5' UTR
+
+## Region Targeting
+
+The `region` config key controls which transcript regions to include for mutation filtering and probe design. Out-of-range exon numbers produce a clear error message.
+
+- `"CDS"` — coding sequence only (default, backward compatible)
+- `"All"` — entire transcript including 5' and 3' UTR
+- Specific exons/UTRs — comma-separated tokens: `"5UTR"`, `"3UTR"`, `"N"` (exon number), `"N-M"` (exon range)
+- Examples: `"3-8"`, `"1-4,8-10"`, `"5UTR,3-5"`, `"5UTR,CDS,3UTR"`
+
+When `region` includes UTR regions ("5UTR", "3UTR", or "All"), the ClinVar query is automatically expanded to include the corresponding UTR consequence types (`5 prime UTR variant`, `3 prime UTR variant`). This ensures UTR variants are fetched without requiring manual changes to `molecular_consequences`.
 
 ## Probe Design Algorithm
 
 Greedy left-to-right sweep (all positions are mRNA-based):
-1. Build forbidden zones: junction_buffer nt on each side of every exon-exon junction
-2. Sort mutations by mRNA position
-3. For each uncovered mutation:
+1. Parse `region` config into allowed mRNA position ranges; validate exon numbers against transcript
+2. Build forbidden zones: junction_buffer nt on each side of every exon-exon junction
+3. Convert cdna_position to mrna_position (handling UTR types); filter mutations to allowed regions
+4. Sort mutations by mRNA position
+5. For each uncovered mutation:
    - Try all valid windows (target_length, then min to max) containing the mutation
    - Score: coverage count × 100 + centering quality × 10 − overlap penalty × 50
    - Centering measured against midpoint of covered mutation range (first + last) / 2, not just the first mutation
    - Hard constraint: no overlap with forbidden zones
+   - Hard constraint: probe must fall entirely within an allowed region
    - Soft constraint: no overlap with existing probes (penalized, not rejected)
-4. Unplaceable mutations (in forbidden zones or at edges) logged as warnings
+6. Unplaceable mutations (in forbidden zones or at edges) logged as warnings
 
 ## Probe Output Naming
 
-- Forward oligo: `{GENE}-{N}-FWD` → `5'-AAAC-[reverse_complement(target)]-3'`
-- Reverse oligo: `{GENE}-{N}-REV` → `5'-AAAA-[target_sequence]-3'`
+- Probe name format: `{GENE}-{exon}-{N}` where `exon` is the exon number or "5UTR"/"3UTR", and `N` is a global sequential counter
+- Forward oligo: `{GENE}-{exon}-{N}-FWD` → `5'-AAAC-[reverse_complement(target)]-3'`
+- Reverse oligo: `{GENE}-{exon}-{N}-REV` → `5'-AAAA-[target_sequence]-3'`
 
 ## HTML Report
 
@@ -193,7 +220,7 @@ Single self-contained file with Plotly CDN. Uses CSS classes throughout (no inli
 - **ClinVar Mutations table**: 11 columns (ID, Protein Change, cDNA Change, Significance, mRNA Position, CDS Position, ClinVar Accession, Chrom, Genomic Pos, Exon, Probe), paginated, sortable, searchable, with horizontal scrollbar and CSV download
   - Mutation IDs use HGVS standard format: `NM_007055.4(POLR3A):c.251G>A` (transcript + gene in parentheses + cDNA change)
   - Probe column deduplicates — multiple mutations at the same position show the probe name once
-- **Designed Probes table**: 11 columns (Probe Name, mRNA Start/End, CDS Start/End, Length, Target, FWD/REV Oligo, Mutations Covered, cDNA Changes), paginated (10/page default), sortable, searchable, with horizontal scrollbar and CSV download
+- **Designed Probes table**: 12 columns (Probe Name, Exon, mRNA Start/End, CDS Start/End, Length, Target, FWD/REV Oligo, Mutations Covered, cDNA Changes), paginated (10/page default), sortable, searchable, with horizontal scrollbar and CSV download
   - cDNA Changes column has no max-width constraint (removed `seq-cell` class) so full content is always visible
 - **Annotated mRNA Sequence**: exon blocks with labels, grey UTR backgrounds, colored mutation text with custom CSS tooltips (using `data-tip` attribute + `::after` pseudo-element for immediate display, `cursor: help`), probe regions shown as alternating colored backgrounds (`#dee6ef` for odd probes, `#ffffd7` for even probes, RGB-averaged blend `#eef2e3` where probes overlap), probe name labels centered at probe midpoints using invisible dash padding (`color: transparent; user-select: none`) in same 12px `'Courier New',monospace` font as nucleotides for exact character-level alignment, 100 nt per line in 10-nt groups
 - **Copy Sequence button**: copies from a hidden div formatted for paste (60 nt/row, rich text with inline styles for paste compatibility, exon headers include probe ranges like "Exon 2 (positions 153-288, probes 2 to 5)", no position numbers or probe labels in sequence)
@@ -213,6 +240,7 @@ The visual HTML uses CSS classes (defined in the `<style>` block) instead of inl
 - `results/{gene}/{gene}_report.html`: Interactive HTML report
 - `results/{gene}/probes.tsv`: Probe data (same columns as report probes table)
 - `results/{gene}/{gene}_mutations.tsv`: Detailed mutation data with all computed fields (same as CSV download from report)
+- `results/{gene}/IDT_order.tsv`: IDT ordering file with columns `Probe_name_fwd  fwd_seq  Probe_name_rev  rev_seq`
 
 ## Known Limitations / Improvement Areas
 

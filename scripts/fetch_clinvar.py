@@ -132,15 +132,31 @@ def esummary_batch(ids: list[str], api_key: str) -> list[dict]:
     return all_records
 
 
-def parse_cdna_position(cdna_change: str) -> int | None:
-    """Extract cDNA position from HGVS notation like 'c.761G>A' -> 761.
+def parse_cdna_position(cdna_change: str) -> tuple[int | None, str | None]:
+    """Extract cDNA position and type from HGVS notation.
 
-    Returns the c.N value (CDS-relative position), NOT the mRNA position.
+    Handles both short form (c.761G>A) and full HGVS form
+    (NM_007055.4(POLR3A):c.-15C>T).
+
+    Returns:
+        (position, cdna_type) where:
+        - c.761G>A  -> (761, "CDS")
+        - c.-5G>A   -> (5, "5UTR")
+        - c.*5G>A   -> (5, "3UTR")
+        - unparseable -> (None, None)
     """
     if not cdna_change:
-        return None
-    m = re.match(r"c\.(\d+)", cdna_change)
-    return int(m.group(1)) if m else None
+        return None, None
+    m = re.search(r"c\.-(\d+)", cdna_change)
+    if m:
+        return int(m.group(1)), "5UTR"
+    m = re.search(r"c\.\*(\d+)", cdna_change)
+    if m:
+        return int(m.group(1)), "3UTR"
+    m = re.search(r"c\.(\d+)", cdna_change)
+    if m:
+        return int(m.group(1)), "CDS"
+    return None, None
 
 
 TRANSCRIPT_RE = re.compile(r"(NM_\d+\.\d+)")
@@ -175,7 +191,7 @@ def parse_record(record: dict) -> dict | None:
 
     accession = record.get("accession", "")
 
-    cdna_pos = parse_cdna_position(cdna_change)
+    cdna_pos, cdna_type = parse_cdna_position(cdna_change)
 
     return {
         "gene": gene_symbol,
@@ -188,6 +204,7 @@ def parse_record(record: dict) -> dict | None:
         "pos_end": pos_end,
         "clinvar_accession": accession,
         "cdna_position": cdna_pos,
+        "cdna_type": cdna_type,
     }
 
 
@@ -195,8 +212,20 @@ def main():
     gene = snakemake.params.gene
     api_key = snakemake.params.api_key
     consequences = snakemake.params.molecular_consequences
+    region = snakemake.params.region
     output_mutations = snakemake.output.mutations
     output_transcript = snakemake.output.transcript_id
+
+    # Auto-expand consequences to include UTR types when region needs them
+    if consequences != "all":
+        consequences = list(consequences) if isinstance(consequences, list) else [consequences]
+        region_lower = region.lower() if region else ""
+        needs_5utr = "5utr" in region_lower or region_lower == "all"
+        needs_3utr = "3utr" in region_lower or region_lower == "all"
+        if needs_5utr and "5 prime UTR variant" not in consequences:
+            consequences.append("5 prime UTR variant")
+        if needs_3utr and "3 prime UTR variant" not in consequences:
+            consequences.append("3 prime UTR variant")
 
     consequence_desc = "all types" if consequences == "all" else ", ".join(consequences)
     log.info(f"Fetching ClinVar variants for gene: {gene} (consequences: {consequence_desc})")
@@ -237,11 +266,14 @@ def main():
         f"({transcript_counter[principal_transcript]}/{len(parsed)} records)"
     )
 
-    # Sort by cdna_position (records without go to the end)
+    # Sort by cdna_type then cdna_position (records without go to the end)
+    type_order = {"5UTR": 0, "CDS": 1, "3UTR": 2}
     df = pd.DataFrame(parsed)
+    df["_sort_key"] = df["cdna_type"].map(type_order).fillna(3)
     df = df.sort_values(
-        "cdna_position", na_position="last"
+        ["_sort_key", "cdna_position"], na_position="last"
     ).reset_index(drop=True)
+    df = df.drop(columns=["_sort_key"])
     df.to_csv(output_mutations, sep="\t", index=False)
     log.info(f"Wrote {len(df)} mutations to {output_mutations}")
 
