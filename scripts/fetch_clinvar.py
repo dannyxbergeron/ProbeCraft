@@ -177,6 +177,8 @@ def parse_record(record: dict) -> dict | None:
 
     protein_change = record.get("protein_change", "") or ""
     cdna_change = var.get("cdna_change", "") or ""
+    # Strip leading transcript(gene): prefix (ClinVar includes it for UTR variants)
+    cdna_change = re.sub(r'^[A-Z]{2}_\d+\.\d+\([^)]+\):', '', cdna_change)
 
     clinical_sig = (
         record.get("germline_classification", {}).get("description", "")

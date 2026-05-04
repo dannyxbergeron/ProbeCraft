@@ -125,7 +125,7 @@ The principal transcript is auto-discovered from ClinVar data (most common NM_ a
    - Valid ClinVar values: missense variant, intron variant, synonymous variant, non-coding transcript variant, frameshift variant, 5 prime UTR variant, 3 prime UTR variant, nonsense, splice donor variant, splice acceptor variant, inframe deletion, inframe insertion, initiator codon variant, inframe indel, stop lost, genic upstream transcript variant, genic downstream transcript variant, no sequence alteration
    - Returns: protein change, cDNA change, clinical significance, genomic position, ClinVar accession
    - cDNA position parsed from HGVS notation (`c.761G>A` → 761), stored as CDS-relative `cdna_position`; also parses UTR positions (`c.-5` → 5' UTR, `c.*5` → 3' UTR) with `cdna_type` column
-   - ClinVar `cdna_change` field may contain short form (`c.3G>T`) or full HGVS form (`NM_007055.4(POLR3A):c.-15C>T`); parser uses `re.search` to handle both
+   - ClinVar `cdna_change` field may contain short form (`c.3G>T`) or full HGVS form (`NM_007055.4(POLR3A):c.-15C>T`); the `transcript(gene):` prefix is stripped on extraction so `cdna_change` always stores the short form (e.g., `c.*18C>T`)
    - UTR consequence types (`5 prime UTR variant`, `3 prime UTR variant`) are automatically added to the ClinVar query when `region` includes "5UTR", "3UTR", or "All" — no need to add them manually to `molecular_consequences`
    - Batch esummary (200 IDs/call), rate limit 3 req/s without API key
    - Rate limiting: 0.5s delay between requests without API key (0.11s with key), with exponential backoff retry (up to 5 retries) on 429 errors — handles parallel multi-gene runs
@@ -160,7 +160,7 @@ TSV with columns: `junction_id  mrna_position  exon_before  exon_after`
 TSV with columns: `probe_name  mrna_start  mrna_end  cds_start  cds_end  length  target_sequence  fwd_oligo  rev_oligo  mutations_covered  cdna_changes_covered  mutation_positions  exon`
 - `mrna_start`/`mrna_end`: absolute positions on the spliced mRNA (1-based)
 - `cds_start`/`cds_end`: CDS-relative positions (can be negative for 5' UTR probes)
-- `mutations_covered`: comma-separated protein changes (empty string if variant has no protein change, e.g. nonsense)
+- `mutations_covered`: comma-separated protein changes; "N/A" if probe covers only non-coding variants (e.g. UTR probes with no protein change)
 - `cdna_changes_covered`: comma-separated cDNA change strings (empty string if missing)
 - `mutation_positions`: comma-separated mRNA positions
 - `fwd_oligo` = `AAAC` + reverse_complement(target_sequence)
@@ -219,6 +219,7 @@ Single self-contained file with Plotly CDN. Uses CSS classes throughout (no inli
 - **Interactive transcript map**: 3-lane Plotly chart (exons, mutations, probes) with hover tooltips
 - **ClinVar Mutations table**: 11 columns (ID, Protein Change, cDNA Change, Significance, mRNA Position, CDS Position, ClinVar Accession, Chrom, Genomic Pos, Exon, Probe), paginated, sortable, searchable, with horizontal scrollbar and CSV download
   - Mutation IDs use HGVS standard format: `NM_007055.4(POLR3A):c.251G>A` (transcript + gene in parentheses + cDNA change)
+  - CDS Position column uses formatted display: bare integer for CDS, `*N` for 3' UTR (e.g., `*18`), `-N` for 5' UTR (e.g., `-5`)
   - Probe column deduplicates — multiple mutations at the same position show the probe name once
 - **Designed Probes table**: 12 columns (Probe Name, Exon, mRNA Start/End, CDS Start/End, Length, Target, FWD/REV Oligo, Mutations Covered, cDNA Changes), paginated (10/page default), sortable, searchable, with horizontal scrollbar and CSV download
   - cDNA Changes column has no max-width constraint (removed `seq-cell` class) so full content is always visible
@@ -249,7 +250,7 @@ The visual HTML uses CSS classes (defined in the `<style>` block) instead of inl
 - The probe overlap penalty (−50) is a heuristic; may need tuning for edge cases
 - Report uses Plotly CDN — requires internet to load JS (data is embedded)
 - Some ClinVar records may lack a parseable cDNA position — these are kept in the mutations file but excluded from probe design
-- Non-missense variants (e.g. nonsense) may lack a protein change — these are stored as empty strings in probe output
+- Non-missense variants (e.g. nonsense) may lack a protein change — these are stored as empty strings in probe output; UTR probes show "N/A" in the Mutations Covered column
 - The Copy Sequence button uses Clipboard API which may not work in all browsers (falls back to execCommand)
 
 ## Reference Documents

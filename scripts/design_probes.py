@@ -294,7 +294,7 @@ def design_probes(
             "target_sequence": target_seq,
             "fwd_oligo": fwd_oligo,
             "rev_oligo": rev_oligo,
-            "mutations_covered": ",".join(covered_mutations),
+            "mutations_covered": "N/A" if not any(covered_mutations) else ",".join(covered_mutations),
             "cdna_changes_covered": ",".join(covered_cdna),
             "mutation_positions": ",".join(str(p) for p in covered_positions),
             "exon": exon_label,

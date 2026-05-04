@@ -173,6 +173,20 @@ def build_enriched_mutations(mutations_df, cds_start, cds_end, junctions_df,
     # HGVS ID: NM_007055.4(POLR3A):c.251G>A
     df["id"] = df["transcript_id"] + "(" + df["gene"] + "):" + df["cdna_change"]
 
+    # CDS Position display: prefix * for 3UTR, - for 5UTR
+    def _format_cds_pos(row):
+        if pd.isna(row.get("cdna_position")):
+            return ""
+        pos = int(row["cdna_position"])
+        cdna_type = row.get("cdna_type", "CDS") or "CDS"
+        if cdna_type == "3UTR":
+            return f"*{pos}"
+        elif cdna_type == "5UTR":
+            return f"-{pos}"
+        return str(pos)
+
+    df["cds_position_display"] = df.apply(_format_cds_pos, axis=1)
+
     # Exon number
     df["exon"] = df["mrna_position"].apply(
         lambda p: compute_exon_number(p, junctions_df, cds_start, cds_end)
@@ -225,7 +239,7 @@ def build_plotly_figure(mutations_df, accession, junctions_df, probes_df, seq_le
         f"Significance: {row['clinical_significance']}<br>"
         f"Accession: {row['clinvar_accession']}<br>"
         f"mRNA Position: {int(row['mrna_position'])}<br>"
-        f"CDS Position: {int(row['cdna_position']) if pd.notna(row.get('cdna_position')) else ''}"
+        f"CDS Position: {row['cds_position_display']}"
         for _, row in mut_valid.iterrows()
     ]
     fig.add_trace(
@@ -519,13 +533,13 @@ def build_annotated_sequence(sequence, cds_start, cds_end, junctions_df, mutatio
 
 def write_mutations_file(mutations_df, output_path):
     """Write the detailed mutations TSV file."""
-    cols = ["id", "mrna_position", "cdna_position", "clinical_significance",
+    cols = ["id", "mrna_position", "cds_position_display", "clinical_significance",
             "cdna_change", "protein_change", "clinvar_accession",
             "chrom", "pos_start", "exon", "probe"]
     out_df = mutations_df[[c for c in cols if c in mutations_df.columns]].copy()
     out_df = out_df.rename(columns={
         "mrna_position": "mRNA Position",
-        "cdna_position": "CDS Position",
+        "cds_position_display": "CDS Position",
         "clinical_significance": "Significance",
         "cdna_change": "cDNA Change",
         "protein_change": "Protein Change",
@@ -794,7 +808,7 @@ function renderMutations() {
     <td>${m.cdna_change || ''}</td>
     <td>${m.clinical_significance || ''}</td>
     <td>${m.mrna_position != null ? m.mrna_position : ''}</td>
-    <td>${m.cdna_position != null ? m.cdna_position : ''}</td>
+    <td>${m.cds_position_display || ''}</td>
     <td>${m.clinvar_accession || ''}</td>
     <td>${m.chrom || ''}</td>
     <td>${m.pos_start || ''}</td>
@@ -885,7 +899,7 @@ function downloadMutationsCSV() {
   const header = 'ID,Protein Change,cDNA Change,Significance,mRNA Position,CDS Position,ClinVar Accession,Chrom,Genomic Pos,Exon,Probe';
   const rows = filteredMutations.map(m =>
     [m.id||'', m.protein_change||'', m.cdna_change||'', m.clinical_significance||'',
-     m.mrna_position!=null?m.mrna_position:'', m.cdna_position!=null?m.cdna_position:'',
+     m.mrna_position!=null?m.mrna_position:'', m.cds_position_display||'',
      m.clinvar_accession||'', m.chrom||'', m.pos_start||'', m.exon||'', m.probe||'']
     .map(v => '"'+String(v).replace(/"/g,'""')+'"').join(',')
   );
